@@ -1,0 +1,42 @@
+{
+  "targets": [
+    {
+      "id": "postgres-primary",
+      "resource_type": "postgresql",
+      "endpoint_file": "/run/secrets/postgresql-admin-dsn",
+      "max_resources": 100,
+      "max_concurrent_operations": 2,
+      "max_connections_per_resource": 20
+    },
+    {
+      "id": "valkey-primary",
+      "resource_type": "valkey",
+      "endpoint_file": "/run/secrets/valkey-admin-url",
+      "max_resources": 100,
+      "max_concurrent_operations": 2,
+      "allowed_valkey_commands": [
+        "get",
+        "set",
+        "del",
+        "expire",
+        "ttl"
+      ]
+    },
+    {
+      "id": "nats-primary",
+      "resource_type": "nats",
+      "endpoint_file": "/run/secrets/nats-url",
+      "max_resources": 100,
+      "max_concurrent_operations": 2,
+      "nats_operator_seed_file": "/run/secrets/nats-operator-seed",
+      "nats_system_credentials_file": "/run/secrets/nats-system.creds",
+      "nats_max_connections": 20,
+      "nats_max_subscriptions": 200,
+      "nats_max_payload_bytes": 1048576,
+      "nats_jetstream_memory_bytes": 67108864,
+      "nats_jetstream_disk_bytes": 1073741824,
+      "nats_jetstream_max_streams": 10,
+      "nats_jetstream_max_consumers": 50
+    }
+  ]
+}

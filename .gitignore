@@ -1,0 +1,19 @@
+/bin/
+/coverage.out
+/coverage.html
+/data/
+*.db
+*.db-shm
+*.db-wal
+
+# Local credentials and operator-only configuration
+.env
+.env.*
+!.env.example
+/config/*.local.json
+/secrets/
+*.pem
+*.key
+*.p12
+*.pfx
+*.creds

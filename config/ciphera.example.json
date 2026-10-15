@@ -1,0 +1,9 @@
+{
+  "api_url": "https://ciphera.example.test",
+  "service_key_file": "/run/secrets/ciphera-service-key",
+  "project_ids_by_environment": {
+    "development": "example-development-project",
+    "staging": "example-staging-project",
+    "production": "example-production-project"
+  }
+}

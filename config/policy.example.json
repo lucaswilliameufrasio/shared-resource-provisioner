@@ -1,0 +1,10 @@
+{
+  "grants": [
+    {
+      "subject": "example-oidc-subject",
+      "applications": ["orders"],
+      "environments": ["development"],
+      "actions": ["plan_resource"]
+    }
+  ]
+}
