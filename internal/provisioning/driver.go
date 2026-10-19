@@ -21,6 +21,12 @@ type Driver interface {
 	Revoke(ctx context.Context, resource domain.Resource) error
 }
 
+type RotationDriver interface {
+	StageRotation(ctx context.Context, resource domain.Resource, newGeneration int64) (Credential, error)
+	FinalizeRotation(ctx context.Context, resource domain.Resource, oldGeneration int64, newGeneration int64, allGenerations []int64) error
+	AbortRotation(ctx context.Context, resource domain.Resource, generation int64) error
+}
+
 type DriverFailure struct {
 	Code                   string
 	ReconciliationRequired bool

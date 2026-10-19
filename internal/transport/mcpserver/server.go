@@ -22,6 +22,10 @@ type Lifecycle interface {
 	Revoke(ctx context.Context, command domain.RevokeResourceCommand, idempotencyKey string) (domain.ResourceView, error)
 }
 
+type rotationLifecycle interface {
+	Rotate(ctx context.Context, command domain.RotateResourceCommand) (domain.RotationReceipt, error)
+}
+
 type PlanResourceInput struct {
 	ResourceType string `json:"resource_type" jsonschema:"Resource kind: postgresql, valkey, or nats"`
 	Application  string `json:"application" jsonschema:"Authorized application scope in lowercase letters, digits, and hyphens"`
@@ -45,6 +49,11 @@ type RevokeResourceInput struct {
 	IdempotencyKey string `json:"idempotency_key" jsonschema:"Stable request key for safe retries"`
 }
 
+type RotateResourceInput struct {
+	ResourceID     string `json:"resource_id" jsonschema:"Stable resource ID returned by create_resource"`
+	IdempotencyKey string `json:"idempotency_key" jsonschema:"Stable request key for safe retries"`
+}
+
 func New(planner Planner, logger *slog.Logger, lifecycle ...Lifecycle) (*mcp.Server, error) {
 	if planner == nil {
 		return nil, errors.New("resource planner is required")
@@ -56,12 +65,17 @@ func New(planner Planner, logger *slog.Logger, lifecycle ...Lifecycle) (*mcp.Ser
 		return nil, errors.New("at most one lifecycle service is allowed")
 	}
 	var resourceLifecycle Lifecycle
+	var rotationService rotationLifecycle
 	if len(lifecycle) == 1 {
 		resourceLifecycle = lifecycle[0]
+		rotationService, _ = resourceLifecycle.(rotationLifecycle)
 	}
 	instructions := "Plan isolated shared PostgreSQL, Valkey, and NATS resources. Planning does not mutate infrastructure. Credential values are never available through MCP."
 	if resourceLifecycle != nil {
 		instructions = "Plan and manage isolated shared PostgreSQL, Valkey, and NATS resources within authorized scopes. Create and revoke are explicit lifecycle actions. Credential values are never available through MCP; responses contain secret references only."
+	}
+	if rotationService != nil {
+		instructions = "Plan and manage isolated shared PostgreSQL, Valkey, and NATS resources within authorized scopes. Create, revoke, and staged credential rotation are explicit lifecycle actions. Rotation references are delivered only to the OIDC-authenticated workload polling API; MCP responses never contain credentials or rotation secret references."
 	}
 
 	server := mcp.NewServer(
@@ -149,6 +163,26 @@ func New(planner Planner, logger *slog.Logger, lifecycle ...Lifecycle) (*mcp.Ser
 			},
 		)
 	}
+	if rotationService != nil {
+		mcp.AddTool(
+			server,
+			&mcp.Tool{
+				Name:        "rotate_resource",
+				Description: "Stage a new credential for an authorized resource. The workload obtains the immutable reference from the OIDC-protected runtime polling endpoint and confirms adoption; this MCP action never returns the reference or credential value.",
+				Annotations: &mcp.ToolAnnotations{IdempotentHint: true, DestructiveHint: boolPointer(false), OpenWorldHint: boolPointer(true)},
+			},
+			func(ctx context.Context, _ *mcp.CallToolRequest, input RotateResourceInput) (*mcp.CallToolResult, domain.RotationReceipt, error) {
+				receipt, err := rotationService.Rotate(ctx, domain.RotateResourceCommand{
+					ResourceID:     input.ResourceID,
+					IdempotencyKey: input.IdempotencyKey,
+				})
+				if err != nil {
+					return nil, domain.RotationReceipt{}, safeToolError(err)
+				}
+				return nil, receipt, nil
+			},
+		)
+	}
 	return server, nil
 }
 
@@ -176,6 +210,10 @@ func safeToolError(err error) error {
 		return errors.New("RECONCILIATION_REQUIRED")
 	case errors.Is(err, provisioning.ErrRevocationFailed):
 		return errors.New("REVOCATION_REQUIRES_RECONCILIATION")
+	case errors.Is(err, provisioning.ErrRotationFailed):
+		return errors.New("ROTATION_FAILED")
+	case errors.Is(err, provisioning.ErrRotationReconciliation):
+		return errors.New("ROTATION_REQUIRES_RECONCILIATION")
 	case errors.Is(err, provisioning.ErrTargetUnavailable):
 		return errors.New("TARGET_UNAVAILABLE")
 	case errors.Is(err, domain.ErrInvalidIdempotencyKey):
@@ -192,6 +230,14 @@ func safeToolError(err error) error {
 		return errors.New("RESOURCE_ALREADY_EXISTS")
 	case errors.Is(err, domain.ErrResourceAlreadyRevoked):
 		return errors.New("RESOURCE_ALREADY_REVOKED")
+	case errors.Is(err, domain.ErrRotationNotFound):
+		return errors.New("ROTATION_NOT_FOUND")
+	case errors.Is(err, domain.ErrRotationMismatch):
+		return errors.New("ROTATION_ACKNOWLEDGEMENT_MISMATCH")
+	case errors.Is(err, domain.ErrRotationInProgress):
+		return errors.New("ROTATION_IN_PROGRESS")
+	case errors.Is(err, domain.ErrRotationReconciliation):
+		return errors.New("ROTATION_RECONCILIATION_REQUIRED")
 	case errors.Is(err, domain.ErrOperationInProgress):
 		return errors.New("OPERATION_IN_PROGRESS")
 	case errors.Is(err, domain.ErrOperationCapacityReached):

@@ -3,6 +3,7 @@ package domain
 import (
 	"errors"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -20,11 +21,28 @@ var (
 	ErrTargetCapacityReached     = errors.New("TARGET_CAPACITY_REACHED")
 	ErrOperationCapacityReached  = errors.New("TARGET_OPERATION_CAPACITY_REACHED")
 	ErrInvalidResourceTransition = errors.New("INVALID_RESOURCE_TRANSITION")
+	ErrRotationNotFound          = errors.New("ROTATION_NOT_FOUND")
+	ErrRotationMismatch          = errors.New("ROTATION_ACKNOWLEDGEMENT_MISMATCH")
+	ErrRotationInProgress        = errors.New("ROTATION_IN_PROGRESS")
+	ErrRotationReconciliation    = errors.New("ROTATION_RECONCILIATION_REQUIRED")
 )
 
 const (
 	ActionCreateResource = "create_resource"
 	ActionRevokeResource = "revoke_resource"
+	ActionRotateResource = "rotate_resource"
+	ActionAdoptRotation  = "adopt_rotation"
+)
+
+type RotationStatus string
+
+const (
+	RotationStaging                RotationStatus = "staging"
+	RotationPending                RotationStatus = "pending"
+	RotationFinalizing             RotationStatus = "finalizing"
+	RotationReconciliationRequired RotationStatus = "reconciliation_required"
+	RotationCompleted              RotationStatus = "completed"
+	RotationFailed                 RotationStatus = "failed"
 )
 
 type ResourceStatus string
@@ -59,9 +77,68 @@ type RevokeResourceCommand struct {
 	Confirmation string
 }
 
+type RotateResourceCommand struct {
+	ResourceID     string
+	IdempotencyKey string
+}
+
+type RotationAcknowledgement struct {
+	ResourceID      string
+	OperationID     string
+	SecretReference string
+	SecretVersion   string
+	Generation      int64
+}
+
+type Rotation struct {
+	OperationID      string
+	ResourceID       string
+	OldGeneration    int64
+	NewGeneration    int64
+	OldSecretURI     string
+	OldSecretVersion string
+	CredentialName   string
+	SecretURI        string
+	SecretVersion    string
+	Status           RotationStatus
+	AcknowledgedAt   time.Time
+	LeaseExpiresAt   time.Time
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+}
+
+type RotationReceipt struct {
+	ResourceID  string         `json:"resource_id"`
+	OperationID string         `json:"operation_id"`
+	Generation  int64          `json:"generation"`
+	Status      RotationStatus `json:"status"`
+	CreatedAt   time.Time      `json:"created_at"`
+	UpdatedAt   time.Time      `json:"updated_at"`
+}
+
+type PendingRotation struct {
+	ResourceID      string         `json:"resource_id"`
+	OperationID     string         `json:"operation_id"`
+	CredentialName  string         `json:"credential_name"`
+	SecretReference string         `json:"secret_reference"`
+	SecretVersion   string         `json:"secret_version,omitempty"`
+	Generation      int64          `json:"generation"`
+	Status          RotationStatus `json:"status"`
+}
+
 func ValidateRevokeResourceCommand(command RevokeResourceCommand) error {
 	if command.ResourceID == "" || command.Confirmation != "revoke:"+command.ResourceID {
 		return ErrInvalidResourceTransition
+	}
+	return nil
+}
+
+func ValidateRotateResourceCommand(command RotateResourceCommand) error {
+	if command.ResourceID == "" || len(command.ResourceID) > 128 || strings.TrimSpace(command.ResourceID) != command.ResourceID {
+		return ErrInvalidResourceTransition
+	}
+	if !idempotencyKeyPattern.MatchString(command.IdempotencyKey) {
+		return ErrInvalidIdempotencyKey
 	}
 	return nil
 }
@@ -71,17 +148,20 @@ func ValidIdempotencyKey(value string) bool {
 }
 
 type Resource struct {
-	ID            string
-	ResourceType  ResourceType
-	Scope         Scope
-	LogicalName   string
-	TargetID      string
-	Status        ResourceStatus
-	SecretURI     string
-	SecretVersion string
-	ErrorCode     string
-	CreatedAt     time.Time
-	UpdatedAt     time.Time
+	ID                    string
+	ResourceType          ResourceType
+	Scope                 Scope
+	LogicalName           string
+	TargetID              string
+	Status                ResourceStatus
+	SecretURI             string
+	SecretVersion         string
+	CredentialGeneration  int64
+	RotationStatus        RotationStatus
+	CredentialGenerations []int64
+	ErrorCode             string
+	CreatedAt             time.Time
+	UpdatedAt             time.Time
 }
 
 type Operation struct {
@@ -107,6 +187,7 @@ type ResourceView struct {
 	Status          ResourceStatus `json:"status"`
 	SecretReference string         `json:"secret_reference,omitempty"`
 	SecretVersion   string         `json:"secret_version,omitempty"`
+	RotationStatus  RotationStatus `json:"rotation_status,omitempty"`
 	ErrorCode       string         `json:"error_code,omitempty"`
 	CreatedAt       time.Time      `json:"created_at"`
 	UpdatedAt       time.Time      `json:"updated_at"`
@@ -127,15 +208,16 @@ func ValidateCreateResourceCommand(command CreateResourceCommand) error {
 
 func (resource Resource) View() ResourceView {
 	view := ResourceView{
-		ID:           resource.ID,
-		ResourceType: resource.ResourceType,
-		Application:  resource.Scope.Application,
-		Environment:  resource.Scope.Environment,
-		LogicalName:  resource.LogicalName,
-		Status:       resource.Status,
-		ErrorCode:    resource.ErrorCode,
-		CreatedAt:    resource.CreatedAt.UTC(),
-		UpdatedAt:    resource.UpdatedAt.UTC(),
+		ID:             resource.ID,
+		ResourceType:   resource.ResourceType,
+		Application:    resource.Scope.Application,
+		Environment:    resource.Scope.Environment,
+		LogicalName:    resource.LogicalName,
+		Status:         resource.Status,
+		RotationStatus: resource.RotationStatus,
+		ErrorCode:      resource.ErrorCode,
+		CreatedAt:      resource.CreatedAt.UTC(),
+		UpdatedAt:      resource.UpdatedAt.UTC(),
 	}
 	if resource.Status == ResourceActive {
 		view.SecretReference = resource.SecretURI

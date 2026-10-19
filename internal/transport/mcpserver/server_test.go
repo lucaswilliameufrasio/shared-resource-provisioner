@@ -166,14 +166,14 @@ func TestLifecycleToolsAreTypedAndReturnOnlySecretReferences(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListTools() error = %v", err)
 	}
-	if len(tools.Tools) != 4 {
-		t.Fatalf("lifecycle-enabled tools = %+v, want plan and three typed lifecycle tools", tools.Tools)
+	if len(tools.Tools) != 5 {
+		t.Fatalf("lifecycle-enabled tools = %+v, want plan and four typed lifecycle tools", tools.Tools)
 	}
 	toolNames := make(map[string]struct{}, len(tools.Tools))
 	for _, tool := range tools.Tools {
 		toolNames[tool.Name] = struct{}{}
 	}
-	for _, name := range []string{"plan_resource", "create_resource", "inspect_resource", "revoke_resource"} {
+	for _, name := range []string{"plan_resource", "create_resource", "inspect_resource", "revoke_resource", "rotate_resource"} {
 		if _, exists := toolNames[name]; !exists {
 			t.Fatalf("tool %q is not registered", name)
 		}
@@ -221,7 +221,76 @@ func TestLifecycleToolsAreTypedAndReturnOnlySecretReferences(t *testing.T) {
 	if err != nil || revokeTool.IsError || lifecycle.revokeCommand.Confirmation != "revoke:resource-123" || lifecycle.revokeIdempotencyKey != "revoke-123" {
 		t.Fatalf("revoke_resource result = %+v, err=%v, command=%+v, key=%q", revokeTool, err, lifecycle.revokeCommand, lifecycle.revokeIdempotencyKey)
 	}
+	rotateTool, err := session.CallTool(clientContext, &mcp.CallToolParams{
+		Name: "rotate_resource",
+		Arguments: map[string]any{
+			"resource_id":     "resource-123",
+			"idempotency_key": "rotate-123",
+		},
+	})
+	if err != nil || rotateTool.IsError || lifecycle.rotateCommand.ResourceID != "resource-123" || lifecycle.rotateCommand.IdempotencyKey != "rotate-123" {
+		t.Fatalf("rotate_resource result = %+v, err=%v, command=%+v", rotateTool, err, lifecycle.rotateCommand)
+	}
+	rotationJSON, err := json.Marshal(rotateTool.StructuredContent)
+	if err != nil || strings.Contains(string(rotationJSON), "secret_reference") || strings.Contains(string(rotationJSON), "ciphera://") {
+		t.Fatalf("rotate_resource returned a runtime-only secret reference: %s, %v", rotationJSON, err)
+	}
 
+	_ = session.Close()
+	cancelServer()
+	select {
+	case <-serverDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("MCP server did not stop after cancellation")
+	}
+}
+
+func TestLifecycleWithoutOIDCRuntimeDoesNotExposeRotationTool(t *testing.T) {
+	t.Parallel()
+
+	policy, err := authorization.NewPolicy([]authorization.Grant{{
+		Subject:      "subject-123",
+		Applications: []string{"orders"},
+		Environments: []string{"production"},
+		Actions:      []authorization.Action{authorization.ActionPlanResource},
+	}})
+	if err != nil {
+		t.Fatalf("NewPolicy() error = %v", err)
+	}
+	planner, err := planning.NewService(policy, testAuditor{})
+	if err != nil {
+		t.Fatalf("planning.NewService() error = %v", err)
+	}
+	server, err := New(planner, slog.New(slog.NewTextHandler(discardWriter{}, nil)), nonRotatingLifecycle{Lifecycle: &testLifecycle{}})
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverContext, cancelServer := context.WithCancel(identity.WithPrincipal(context.Background(), identity.Principal{
+		Subject:   "subject-123",
+		Transport: identity.TransportStdio,
+	}))
+	defer cancelServer()
+	serverDone := make(chan error, 1)
+	go func() {
+		serverDone <- server.Run(serverContext, serverTransport)
+	}()
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "test"}, nil)
+	clientContext, cancelClient := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelClient()
+	session, err := client.Connect(clientContext, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	tools, err := session.ListTools(clientContext, nil)
+	if err != nil {
+		t.Fatalf("ListTools() error = %v", err)
+	}
+	for _, tool := range tools.Tools {
+		if tool.Name == "rotate_resource" {
+			t.Fatal("rotate_resource was exposed without the OIDC runtime acknowledgement service")
+		}
+	}
 	_ = session.Close()
 	cancelServer()
 	select {
@@ -266,6 +335,11 @@ type testLifecycle struct {
 	inspectResourceID    string
 	revokeCommand        domain.RevokeResourceCommand
 	revokeIdempotencyKey string
+	rotateCommand        domain.RotateResourceCommand
+}
+
+type nonRotatingLifecycle struct {
+	Lifecycle
 }
 
 func (lifecycle *testLifecycle) Create(_ context.Context, request domain.CreateResourceCommand) (domain.ResourceView, error) {
@@ -282,6 +356,11 @@ func (lifecycle *testLifecycle) Revoke(_ context.Context, command domain.RevokeR
 	lifecycle.revokeCommand = command
 	lifecycle.revokeIdempotencyKey = idempotencyKey
 	return lifecycle.resource, nil
+}
+
+func (lifecycle *testLifecycle) Rotate(_ context.Context, command domain.RotateResourceCommand) (domain.RotationReceipt, error) {
+	lifecycle.rotateCommand = command
+	return domain.RotationReceipt{ResourceID: command.ResourceID, OperationID: "operation-123", Generation: 2, Status: domain.RotationPending}, nil
 }
 
 func (discardWriter) Write(data []byte) (int, error) {

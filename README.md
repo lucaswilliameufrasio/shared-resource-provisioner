@@ -8,7 +8,10 @@ The control plane includes SQLite persistence, grant administration, audit,
 Ciphera secret storage, PostgreSQL/Valkey/NATS drivers, and typed MCP lifecycle
 actions. Mutations are disabled by default; without explicit operator
 configuration, MCP exposes planning only. Credential values never cross MCP.
-Rotation remains unavailable until runtimes can acknowledge adoption.
+HTTP exposes staged rotation only when mutations are enabled. The workload gets
+the pending reference through a separate OIDC-protected polling endpoint and
+confirms the exact operation, reference, version, and generation before the old
+target identity is retired. Rotation is not exposed over stdio.
 
 ## Security boundary
 
@@ -63,8 +66,11 @@ the configured OIDC issuer. `SRP_OIDC_AUDIENCE` must match the audience claim
 issued for this resource. The initial verifier supports signed JWT bearer
 tokens; opaque-token introspection is not implemented yet.
 
-The mutation gate defaults to off. To expose typed create/inspect/revoke tools,
-operators must explicitly set `SRP_MUTATIONS_ENABLED=true` and configure both
+The mutation gate defaults to off. Over HTTP, enabling it exposes typed
+create/inspect/revoke/rotate tools plus the OIDC-protected workload rotation
+polling and acknowledgement routes. The rotation tool is deliberately omitted
+from stdio because stdio does not authenticate the workload's OIDC identity.
+Operators must explicitly set `SRP_MUTATIONS_ENABLED=true` and configure both
 `SRP_TARGETS_FILE` and `SRP_CIPHERA_CONFIG_FILE`. Example files contain only
 secret-file paths and non-secret project identifiers:
 
@@ -77,6 +83,30 @@ owner-only files referenced by those configs. Review [the architecture and
 operating constraints](docs/architecture.md) before enabling mutations. The
 gate is not a substitute for protected SQLite backups, tested recovery, and
 operator review of the target's isolation and limits.
+
+The SQLite database must live in a service-owned directory with mode `0700` and
+the database file must be `0600`; startup rejects broader permissions. See the
+[deployment hardening checklist](docs/runbooks/deployment-hardening.md) for
+network, identity, shutdown, logging, and operational requirements.
+
+### Back up the control-plane database
+
+Run the offline-capable backup subcommand against the configured SQLite file:
+
+```sh
+SRP_SQLITE_PATH=/var/lib/shared-resource-provisioner/control.db \
+  ./bin/provisioner backup "/var/backups/shared-resource-provisioner/control-$(date -u +%Y%m%dT%H%M%SZ).db"
+```
+
+The destination must be new. The command creates a consistent snapshot, uses a
+private parent directory (`0700`), and protects the backup file (`0600`). Store
+an encrypted copy off-host using the operator's approved backup system. The
+SQLite file contains control-plane metadata, grants, idempotency state, audit
+facts, and secret references; it does not contain the service credentials held
+by Ciphera. Restoring SQLite alone does not restore target clusters, Ciphera
+projects/identities, TLS material, or operator-only target keys. Follow the
+[host-loss recovery drill](docs/runbooks/host-loss-recovery.md) before enabling
+mutations on a recovered instance.
 
 PostgreSQL endpoint files must contain a PostgreSQL URI; remote endpoints
 require `sslmode=verify-full`. Its accepted query options are `sslmode`,

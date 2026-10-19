@@ -32,10 +32,11 @@ without coupling the tool to Uirapuru.
   and adapter may hold a generated value transiently while writing it to
   Ciphera, but Ciphera values are never persisted in provisioner metadata,
   logs, audit events, or MCP responses.
-- Rotation must be staged so that old credentials remain valid until the
-  runtime confirms adoption of the new reference. The initial Compose
-  integration does not yet provide that acknowledgement, so rotation remains
-  unavailable until an explicit acknowledgement contract is implemented.
+- Rotation is staged across distinct generation-specific target identities and
+  secret names. The old identity and reference remain active until the runtime
+  confirms adoption through the OIDC-protected HTTP callback recorded in
+  ADR 0005. A failed staging attempt must delete its candidate key or remain in
+  reconciliation.
 
 ## Alternatives considered
 
@@ -53,16 +54,17 @@ without coupling the tool to Uirapuru.
 ## Consequences
 
 - The concrete Ciphera `SecretStore` adapter and Compose runtime binding are
-  selected but still must be implemented and integration-tested before
-  provisioning can be enabled.
+  implemented, but intended-environment validation is still required before
+  production provisioning can be enabled.
 - Secret-store failure after a service resource is created must trigger safe
   compensation or a recoverable, non-active state; it must never fall back to
   returning the credential.
 - The operator must provide and protect the Ciphera identities, project
   mappings, and runtime read-only tokens. The workload receives plaintext by
   design and must be trusted.
-- Automated rotation requires a runtime acknowledgement mechanism; it is not
-  part of the first enabled lifecycle until that exists.
+- Automated rotation requires exact runtime acknowledgement and unique
+  generation-scoped secret names; an acknowledgement is an assertion by the
+  authenticated workload, not independent proof of application health.
 
 ## Revisit when
 
