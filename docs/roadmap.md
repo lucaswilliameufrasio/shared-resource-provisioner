@@ -38,10 +38,14 @@
   [38813563850](https://github.com/lucaswilliameufrasio/shared-resource-provisioner/actions/runs/38813563850)
   completed successfully on 2026-10-15, including the quality and isolated
   integration jobs.
-- The local quality gate passed before that commit was pushed. Any follow-up
-  code changes must pass the full local gate and their CI result must be checked
-  before they are treated as verified. The current follow-up remains uncommitted
-  on `feature/production-readiness`; no push was authorized.
+- The local quality gate passed before that initial commit was pushed. The
+  follow-up is commit `cb0c79a` (`feat(rotation): add staged credential
+  rotation`) on `feature/production-readiness`, pushed to `origin`.
+- GitHub Actions run
+  [39310730788](https://github.com/lucaswilliameufrasio/shared-resource-provisioner/actions/runs/39310730788)
+  passed on 2026-10-19 for both `quality` and `isolated-integration`.
+- For future code changes, rerun the complete local gate and check CI after an
+  authorized push; do not treat cached or earlier checks as current evidence.
 - Follow-up verification passed locally on 2026-10-19: `gofmt -l .`, `go vet
   ./...`, `golangci-lint run ./...`, `go test -race -count=1 ./...`, `go build
   ./...`, `go mod verify`, `govulncheck ./...`, and
@@ -89,8 +93,9 @@
    host/runtime, network boundaries, service-enforceable limits, identity setup,
    monitoring destination, and an accountable reviewer. The repository checklist
    is a baseline, not evidence of an operator review.
-4. Keep the complete local quality gate and CI jobs passing for every change;
-   check CI after an authorized push.
+4. Keep the complete local quality gate and CI jobs passing for every future
+   change. This follow-up's local gate and push-triggered CI are green; check CI
+   again after any later authorized push.
 
 Each mutation slice includes authorization, idempotency, audit, compensating or
 reconciliation behavior, and tests against the real service before the MCP tool
