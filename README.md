@@ -34,9 +34,11 @@ See [architecture](docs/architecture.md), [decisions](docs/adr/), and the
 
 ## Development
 
-Requires Go 1.27.2 or newer. Unit tests do not require Docker or external
-services. The opt-in integration suite uses an isolated, loopback-only Compose
-project for PostgreSQL and Valkey and an in-process NATS server. See
+Requires Go 1.27.3 or newer; it includes the standard-library fix for
+GO-2026-6809, which `govulncheck` reports as reachable on Go 1.27.2. Unit tests
+do not require Docker or external services. The opt-in integration suite uses
+an isolated, loopback-only Compose project for PostgreSQL and Valkey and an
+in-process NATS server. See
 [TESTING_STANDARD.md](TESTING_STANDARD.md) for the exact checks.
 
 Run the real-service driver integration suite from the repository root with

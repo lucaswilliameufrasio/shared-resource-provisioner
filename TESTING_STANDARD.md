@@ -2,8 +2,9 @@
 
 ## Verified environment
 
-- Go toolchain: 1.27.2 (required to include fixes for Go 1.27.1 standard-library
-  advisories reported by `govulncheck`).
+- Go toolchain: 1.27.3 or newer. `govulncheck` reports GO-2026-6809 as
+  reachable with Go 1.27.2; this standard-library vulnerability is fixed in
+  Go 1.27.3.
 - Unit tests use local files and in-memory MCP transport tests; they do not
   require Docker, PostgreSQL, Valkey, NATS, an OIDC provider, or production
   credentials.

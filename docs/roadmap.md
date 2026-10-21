@@ -57,6 +57,20 @@
 - The SQLite backup command enforces the existing protected snapshot behavior
   and rejects a missing source database. The local cross-directory restore test
   is not an intended-host-loss drill.
+- Additional local validation passed on 2026-10-19 against a freshly built,
+  disposable Ciphera server backed by an isolated PostgreSQL database. A
+  temporary local service account/key and project exercised the provisioner's
+  real Ciphera client together with disposable PostgreSQL, Valkey, and NATS
+  targets: create, inspect, stage/poll/acknowledge rotation, and revoke. A
+  protected SQLite snapshot restored into a separate local directory and a new
+  read-only provisioner process recovered the grant/resource/pending-rotation
+  state and planned without exposing mutation tools. This validates the real
+  local service/API path, not the intended deployment's Ciphera identities or
+  network policy; runtime OIDC JWT validation was not part of this drill.
+- The complete Go quality gate passed again on Go 1.27.3. The isolated rootless
+  integration suite passed three consecutive fresh runs. `govulncheck` reported
+  no reachable vulnerabilities and one required-module advisory not called by
+  analyzed code.
 
 ## Accepted first-deployment choices
 
@@ -83,11 +97,13 @@
    The expanded local test verifies application data (including a pending
    rotation) but cannot establish host/storage/transfer properties or measured
    RTO/RPO.
-2. **Operator-blocked:** validate Ciphera delivery and compensation/reconciliation
-   against the configured tenant and target clusters in an explicitly isolated,
-   authorized environment. Local protocol-fake and disposable-driver tests do
-   not validate real identities, project mappings, network policy, or runtime
-   key-prefix access. Do not use shared or production services for local tests.
+2. **Operator-blocked:** validate the intended isolated Ciphera tenant/project
+   identities, target mappings, network policy, runtime key-prefix access, and
+   deployment OIDC identity flow. The local drill now exercises the real Ciphera
+   service/client and all three drivers with temporary identities and disposable
+   targets, in addition to the protocol-fake tests; it does not establish that
+   the intended deployment configuration is correct. Do not use shared or
+   production services for local tests.
 3. **Operator-blocked:** complete environment-specific deployment hardening,
    monitoring, security review, and recovery procedures. Requires the intended
    host/runtime, network boundaries, service-enforceable limits, identity setup,
