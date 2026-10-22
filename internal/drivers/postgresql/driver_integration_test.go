@@ -120,6 +120,86 @@ func TestDriverCreatesIsolatedDatabaseEnforcesRoleLimitAndRevokesLocally(t *test
 	if _, err := pgx.ConnectConfig(context.Background(), firstConfig.Copy()); err == nil {
 		t.Fatal("PostgreSQL accepted the application role after resource revocation")
 	}
+
+	rotatingResource := domain.Resource{
+		ID:                   "local-postgres-rotation-resource",
+		ResourceType:         domain.ResourcePostgreSQL,
+		Scope:                domain.Scope{Application: "rotation", Environment: "test"},
+		CredentialGeneration: 1,
+	}
+	initialCredential, err := driver.Create(context.Background(), rotatingResource)
+	if err != nil {
+		t.Fatalf("Create(rotation resource) error = %v", err)
+	}
+	defer clear(initialCredential.Value)
+	defer func() {
+		rotatingResource.CredentialGenerations = []int64{1, 2}
+		if err := driver.Revoke(context.Background(), rotatingResource); err != nil {
+			t.Errorf("Revoke(rotation resource cleanup) error = %v", err)
+		}
+	}()
+	initialConfig, err := pgx.ParseConfig(string(initialCredential.Value))
+	if err != nil {
+		t.Fatalf("ParseConfig(rotation credential) error = %v", err)
+	}
+	initialConnection, err := pgx.ConnectConfig(context.Background(), initialConfig)
+	if err != nil {
+		t.Fatal("initial rotation credential could not connect")
+	}
+	if _, err := initialConnection.Exec(context.Background(), "CREATE TABLE rotation_owned (id integer PRIMARY KEY)"); err != nil {
+		_ = initialConnection.Close(context.Background())
+		t.Fatalf("create object before rotation error = %v", err)
+	}
+	if err := initialConnection.Close(context.Background()); err != nil {
+		t.Fatalf("Close(initial rotation connection) error = %v", err)
+	}
+	rotatingResource.CredentialGenerations = []int64{1, 2}
+	rotatedCredential, err := driver.StageRotation(context.Background(), rotatingResource, 2)
+	if err != nil {
+		t.Fatalf("StageRotation() error = %v", err)
+	}
+	defer clear(rotatedCredential.Value)
+	oldConnection, err := pgx.ConnectConfig(context.Background(), initialConfig.Copy())
+	if err != nil {
+		t.Fatal("old PostgreSQL credential stopped working before acknowledgement")
+	}
+	if err := oldConnection.Close(context.Background()); err != nil {
+		t.Fatalf("Close(old connection before acknowledgement) error = %v", err)
+	}
+	rotatedConfig, err := pgx.ParseConfig(string(rotatedCredential.Value))
+	if err != nil {
+		t.Fatalf("ParseConfig(rotated credential) error = %v", err)
+	}
+	newConnection, err := pgx.ConnectConfig(context.Background(), rotatedConfig)
+	if err != nil {
+		t.Fatal("staged PostgreSQL credential could not connect before acknowledgement")
+	}
+	var visibleRows int
+	if err := newConnection.QueryRow(context.Background(), "SELECT count(*) FROM rotation_owned").Scan(&visibleRows); err != nil || visibleRows != 0 {
+		_ = newConnection.Close(context.Background())
+		t.Fatalf("staged role could not read old-owned table: rows=%d, error=%v", visibleRows, err)
+	}
+	if err := newConnection.Close(context.Background()); err != nil {
+		t.Fatalf("Close(staged connection) error = %v", err)
+	}
+	if err := driver.FinalizeRotation(context.Background(), rotatingResource, 1, 2, []int64{1, 2}); err != nil {
+		t.Fatalf("FinalizeRotation() error = %v", err)
+	}
+	newConnection, err = pgx.ConnectConfig(context.Background(), rotatedConfig.Copy())
+	if err != nil {
+		t.Fatal("new PostgreSQL credential stopped working after acknowledgement")
+	}
+	if _, err := newConnection.Exec(context.Background(), "CREATE TABLE rotation_after_cutover (id integer PRIMARY KEY)"); err != nil {
+		_ = newConnection.Close(context.Background())
+		t.Fatalf("new role did not own the application schema after cutover: %v", err)
+	}
+	if err := newConnection.Close(context.Background()); err != nil {
+		t.Fatalf("Close(new connection after cutover) error = %v", err)
+	}
+	if oldConnection, err := pgx.ConnectConfig(context.Background(), initialConfig.Copy()); err == nil {
+		_ = oldConnection.Close(context.Background())
+		t.Fatal("old PostgreSQL credential remained valid after acknowledgement")
+	}
 }
 
 func waitForPostgres(t *testing.T, configuration *pgx.ConnConfig) {

@@ -39,6 +39,53 @@ func TestRequireBearerTokenSetsVerifiedPrincipal(t *testing.T) {
 	}
 }
 
+func TestNewOIDCTokenVerifierValidatesLocalIssuerTokens(t *testing.T) {
+	t.Parallel()
+
+	issuer := newLocalOIDCIssuer(t)
+	const audience = "shared-resource-provisioner-local-test"
+	verifier, err := NewOIDCTokenVerifier(context.Background(), issuer.server.URL, audience)
+	if err != nil {
+		t.Fatalf("NewOIDCTokenVerifier() error = %v", err)
+	}
+	request := httptest.NewRequest(http.MethodGet, "/", nil)
+
+	validToken := issuer.signedToken(t, "local-workload-subject", audience, time.Now().Add(time.Minute))
+	info, err := verifier(context.Background(), validToken, request)
+	if err != nil {
+		t.Fatalf("verifier(valid token) error = %v", err)
+	}
+	if info.UserID != "local-workload-subject" || info.Expiration.IsZero() {
+		t.Fatalf("verified token info = %+v", info)
+	}
+
+	invalidTokens := []struct {
+		name  string
+		token string
+	}{
+		{
+			name:  "wrong audience",
+			token: issuer.signedToken(t, "local-workload-subject", "wrong-audience", time.Now().Add(time.Minute)),
+		},
+		{
+			name:  "expired",
+			token: issuer.signedToken(t, "local-workload-subject", audience, time.Now().Add(-time.Minute)),
+		},
+		{
+			name:  "invalid subject",
+			token: issuer.signedToken(t, " subject-with-space", audience, time.Now().Add(time.Minute)),
+		},
+	}
+	for _, test := range invalidTokens {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if info, err := verifier(context.Background(), test.token, request); err == nil || info != nil {
+				t.Fatalf("verifier() = (%+v, %v), want token rejection", info, err)
+			}
+		})
+	}
+}
+
 func TestRequireBearerTokenRejectsMissingMalformedAndInvalidTokens(t *testing.T) {
 	t.Parallel()
 

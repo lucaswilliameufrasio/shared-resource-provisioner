@@ -280,6 +280,85 @@ func TestDeriveResourceKeysAreStableAndResourceSpecific(t *testing.T) {
 	}
 }
 
+func TestCredentialGenerationsKeepAccountStableAndPreservePriorRevocations(t *testing.T) {
+	t.Parallel()
+
+	operator, operatorSeed, accountKey, firstUserKey, resource := makeResourceKeys(t)
+	defer operator.Wipe()
+	defer clear(operatorSeed)
+	defer accountKey.Wipe()
+	defer firstUserKey.Wipe()
+	firstAccountPublic, err := accountKey.PublicKey()
+	if err != nil {
+		t.Fatalf("PublicKey(account) error = %v", err)
+	}
+	firstUserPublic, err := firstUserKey.PublicKey()
+	if err != nil {
+		t.Fatalf("PublicKey(generation one) error = %v", err)
+	}
+
+	secondAccount, secondUser, err := deriveResourceKeysForGeneration(operatorSeed, resource, 2)
+	if err != nil {
+		t.Fatalf("deriveResourceKeysForGeneration(2) error = %v", err)
+	}
+	defer secondAccount.Wipe()
+	defer secondUser.Wipe()
+	secondAccountPublic, err := secondAccount.PublicKey()
+	if err != nil {
+		t.Fatalf("PublicKey(second account) error = %v", err)
+	}
+	secondUserPublic, err := secondUser.PublicKey()
+	if err != nil {
+		t.Fatalf("PublicKey(generation two) error = %v", err)
+	}
+	if firstAccountPublic != secondAccountPublic || firstUserPublic == secondUserPublic {
+		t.Fatal("rotation did not preserve the account identity and change the user identity")
+	}
+
+	thirdAccount, thirdUser, err := deriveResourceKeysForGeneration(operatorSeed, resource, 3)
+	if err != nil {
+		t.Fatalf("deriveResourceKeysForGeneration(3) error = %v", err)
+	}
+	defer thirdAccount.Wipe()
+	defer thirdUser.Wipe()
+	thirdUserPublic, err := thirdUser.PublicKey()
+	if err != nil {
+		t.Fatalf("PublicKey(generation three) error = %v", err)
+	}
+	firstJWT, err := buildUserClaims(resource, firstAccountPublic, firstUserPublic, validTarget()).Encode(accountKey)
+	if err != nil {
+		t.Fatalf("Encode(generation one claims) error = %v", err)
+	}
+	firstClaims, err := jwt.DecodeUserClaims(firstJWT)
+	if err != nil {
+		t.Fatalf("DecodeUserClaims(generation one) error = %v", err)
+	}
+	secondJWT, err := buildUserClaims(resource, firstAccountPublic, secondUserPublic, validTarget()).Encode(accountKey)
+	if err != nil {
+		t.Fatalf("Encode(generation two claims) error = %v", err)
+	}
+	secondClaims, err := jwt.DecodeUserClaims(secondJWT)
+	if err != nil {
+		t.Fatalf("DecodeUserClaims(generation two) error = %v", err)
+	}
+	thirdJWT, err := buildUserClaims(resource, firstAccountPublic, thirdUserPublic, validTarget()).Encode(accountKey)
+	if err != nil {
+		t.Fatalf("Encode(generation three claims) error = %v", err)
+	}
+	thirdClaims, err := jwt.DecodeUserClaims(thirdJWT)
+	if err != nil {
+		t.Fatalf("DecodeUserClaims(generation three) error = %v", err)
+	}
+	staged := buildAccountClaimsWithRevocations(validTarget(), resource, firstAccountPublic, []string{firstUserPublic}, time.Now().UTC())
+	if !staged.IsClaimRevoked(firstClaims) || staged.IsClaimRevoked(secondClaims) || staged.IsClaimRevoked(thirdClaims) {
+		t.Fatal("staging generation three did not preserve generation two while retaining the prior revocation")
+	}
+	finalized := buildAccountClaimsWithRevocations(validTarget(), resource, firstAccountPublic, []string{firstUserPublic, secondUserPublic}, time.Now().UTC())
+	if !finalized.IsClaimRevoked(firstClaims) || !finalized.IsClaimRevoked(secondClaims) || finalized.IsClaimRevoked(thirdClaims) {
+		t.Fatal("finalizing generation three did not revoke every superseded user identity")
+	}
+}
+
 func validTarget() config.Target {
 	return config.Target{
 		ID:                        "nats-primary",

@@ -20,6 +20,8 @@ const (
 	ActionCreateResource  Action = "create_resource"
 	ActionInspectResource Action = "inspect_resource"
 	ActionRevokeResource  Action = "revoke_resource"
+	ActionRotateResource  Action = "rotate_resource"
+	ActionAdoptRotation   Action = "adopt_rotation"
 )
 
 var ErrPermissionDenied = errors.New("PERMISSION_DENIED")
@@ -129,7 +131,7 @@ func ValidateGrantRecord(grant GrantRecord) error {
 
 func ValidAction(action Action) bool {
 	switch action {
-	case ActionPlanResource, ActionCreateResource, ActionInspectResource, ActionRevokeResource:
+	case ActionPlanResource, ActionCreateResource, ActionInspectResource, ActionRevokeResource, ActionRotateResource, ActionAdoptRotation:
 		return true
 	default:
 		return false

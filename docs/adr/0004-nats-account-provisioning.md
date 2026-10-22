@@ -27,9 +27,10 @@ must not hold user seeds or generated credentials.
   `$SYS.REQ.CLAIMS.UPDATE` and the configured system-account credentials. Only a
   positive update acknowledgment is success; skipped, rejected, and timed-out
   updates enter the normal compensation/reconciliation path.
-- Revoke the resource user by publishing an updated account claim containing
-  that user key's revocation timestamp. Do not rotate credentials until runtime
-  adoption can be acknowledged.
+- Revoke resource users by publishing updated account claims containing their
+  revocation timestamps. Credential rotation derives a separate user identity
+  per generation under the same account and preserves prior revocations; the old
+  user is revoked only after runtime adoption is acknowledged.
 - NATS endpoints use TLS except on loopback. Operator seeds and system
   credentials are read from owner-only files and never returned or logged.
 

@@ -139,32 +139,13 @@ func (driver *Driver) Create(ctx context.Context, resource domain.Resource) (pro
 }
 
 func (driver *Driver) Revoke(ctx context.Context, resource domain.Resource) error {
-	operatorSeed, err := driver.copyOperatorSeed()
-	if err != nil {
-		return provisioning.NewDriverFailure("TARGET_CONFIGURATION_INVALID", false)
-	}
-	defer clear(operatorSeed)
-	operatorKey, err := nkeys.FromSeed(operatorSeed)
+	operatorKey, accountKey, err := driver.rotationSigningKeys(resource)
 	if err != nil {
 		return provisioning.NewDriverFailure("TARGET_CONFIGURATION_INVALID", false)
 	}
 	defer operatorKey.Wipe()
-	accountKey, userKey, err := deriveResourceKeys(operatorSeed, resource)
-	if err != nil {
-		return provisioning.NewDriverFailure("INVALID_RESOURCE_METADATA", false)
-	}
 	defer accountKey.Wipe()
-	defer userKey.Wipe()
-	accountPublic, err := accountKey.PublicKey()
-	if err != nil {
-		return provisioning.NewDriverFailure("CREDENTIAL_GENERATION_FAILED", false)
-	}
-	userPublic, err := userKey.PublicKey()
-	if err != nil {
-		return provisioning.NewDriverFailure("CREDENTIAL_GENERATION_FAILED", false)
-	}
-	claims := buildAccountClaims(driver.target, resource, accountPublic, userPublic, true, time.Now().UTC())
-	accountJWT, err := claims.Encode(operatorKey)
+	accountJWT, err := driver.encodeGenerationClaims(operatorKey, accountKey, resource, credentialGenerations(resource), 0)
 	if err != nil {
 		return provisioning.NewDriverFailure("CREDENTIAL_GENERATION_FAILED", false)
 	}
@@ -260,6 +241,14 @@ func buildAccountClaims(target config.Target, resource domain.Resource, accountP
 		}
 	}
 	if revoke {
+		claims.RevokeAt(userPublic, now)
+	}
+	return claims
+}
+
+func buildAccountClaimsWithRevocations(target config.Target, resource domain.Resource, accountPublic string, revokedUsers []string, now time.Time) *jwt.AccountClaims {
+	claims := buildAccountClaims(target, resource, accountPublic, "", false, now)
+	for _, userPublic := range revokedUsers {
 		claims.RevokeAt(userPublic, now)
 	}
 	return claims

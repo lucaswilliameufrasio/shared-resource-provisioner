@@ -36,6 +36,34 @@ func TestObjectNamesAreStableAndDistinctFromCallerScope(t *testing.T) {
 	}
 }
 
+func TestRoleNamesAreGenerationSpecificAndKeepDatabaseStable(t *testing.T) {
+	t.Parallel()
+
+	resource := domain.Resource{
+		ID:           "rotation-resource-id",
+		ResourceType: domain.ResourcePostgreSQL,
+		Scope:        domain.Scope{Application: "orders", Environment: "production"},
+	}
+	baseRole, database, err := objectNames(resource)
+	if err != nil {
+		t.Fatalf("objectNames() error = %v", err)
+	}
+	firstRole, firstDatabase, err := roleNameForGeneration(resource, 1)
+	if err != nil {
+		t.Fatalf("roleNameForGeneration(1) error = %v", err)
+	}
+	secondRole, secondDatabase, err := roleNameForGeneration(resource, 2)
+	if err != nil {
+		t.Fatalf("roleNameForGeneration(2) error = %v", err)
+	}
+	if firstRole != baseRole || secondRole == firstRole || firstDatabase != database || secondDatabase != database || len(secondRole) > 63 {
+		t.Fatalf("generation names = (%q,%q), database=(%q,%q), base=(%q,%q)", firstRole, secondRole, firstDatabase, secondDatabase, baseRole, database)
+	}
+	if _, _, err := roleNameForGeneration(resource, 10_000_000_000_000); err == nil {
+		t.Fatal("roleNameForGeneration() accepted an out-of-range generation")
+	}
+}
+
 func TestIdentifierAndLiteralQuotingDoNotAllowSQLStructure(t *testing.T) {
 	t.Parallel()
 

@@ -93,6 +93,160 @@ func TestCreateInspectAndRevokeLifecycleKeepsCredentialOutOfViews(t *testing.T) 
 	}
 }
 
+func TestCredentialRotationKeepsOldCredentialUntilExactOIDCAcknowledgement(t *testing.T) {
+	t.Parallel()
+
+	store := openTestStore(t)
+	grantTestActions(t, store, authorization.ActionCreateResource, authorization.ActionRotateResource, authorization.ActionInspectResource, authorization.ActionRevokeResource)
+	if _, err := store.CreateGrant(context.Background(), authorization.GrantRecord{
+		Subject:     "runtime-subject",
+		Application: "orders",
+		Environment: "production",
+		Action:      authorization.ActionAdoptRotation,
+	}, audit.Event{Subject: "admin-subject", Action: "grant.create", Outcome: audit.OutcomeAllowed}); err != nil {
+		t.Fatalf("CreateGrant(runtime adoption) error = %v", err)
+	}
+	driver := &testDriver{finalizeErrors: []error{errors.New("test target cutover failure")}}
+	secretStore := newTestSecretStore()
+	service := newTestService(t, store, driver, secretStore)
+	callerContext := identity.WithPrincipal(context.Background(), identity.Principal{Subject: "caller-subject", Transport: identity.TransportStdio})
+	runtimeContext := identity.WithPrincipal(context.Background(), identity.Principal{Subject: "runtime-subject", Transport: identity.TransportHTTP})
+	created, err := service.Create(callerContext, domain.CreateResourceCommand{
+		ResourceType:   domain.ResourcePostgreSQL,
+		Scope:          domain.Scope{Application: "orders", Environment: "production"},
+		IdempotencyKey: "rotation-create-001",
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	oldReference := created.SecretReference
+
+	command := domain.RotateResourceCommand{ResourceID: created.ID, IdempotencyKey: "rotation-request-001"}
+	receipt, err := service.Rotate(callerContext, command)
+	if err != nil {
+		t.Fatalf("Rotate() error = %v", err)
+	}
+	if receipt.Status != domain.RotationPending || receipt.Generation != 2 || driver.stageCalls != 1 || len(secretStore.values) != 2 {
+		t.Fatalf("rotation receipt=%+v, stage calls=%d, stored references=%d", receipt, driver.stageCalls, len(secretStore.values))
+	}
+	receiptJSON, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatalf("Marshal(rotation receipt) error = %v", err)
+	}
+	if bytes.Contains(receiptJSON, []byte("secret_reference")) || bytes.Contains(receiptJSON, []byte("ciphera://")) || bytes.Contains(receiptJSON, driver.lastCredential) {
+		t.Fatalf("rotation receipt exposed secret material or reference: %s", receiptJSON)
+	}
+	pending, err := service.PendingRotation(runtimeContext, created.ID)
+	if err != nil {
+		t.Fatalf("PendingRotation() error = %v", err)
+	}
+	if pending.OperationID != receipt.OperationID || pending.Generation != 2 || pending.SecretReference == oldReference || pending.Status != domain.RotationPending {
+		t.Fatalf("pending rotation = %+v", pending)
+	}
+	if _, exists := secretStore.values[oldReference]; !exists {
+		t.Fatal("old credential was removed before adoption acknowledgement")
+	}
+	unauthorizedRuntimeContext := identity.WithPrincipal(context.Background(), identity.Principal{Subject: "ungranted-runtime", Transport: identity.TransportHTTP})
+	if _, err := service.PendingRotation(unauthorizedRuntimeContext, created.ID); !errors.Is(err, authorization.ErrPermissionDenied) {
+		t.Fatalf("PendingRotation(ungranted runtime) error = %v, want permission denied", err)
+	}
+
+	wrongAcknowledgement := domain.RotationAcknowledgement{
+		ResourceID:      created.ID,
+		OperationID:     pending.OperationID,
+		SecretReference: oldReference,
+		SecretVersion:   pending.SecretVersion,
+		Generation:      pending.Generation,
+	}
+	if err := service.AcknowledgeRotation(unauthorizedRuntimeContext, wrongAcknowledgement); !errors.Is(err, authorization.ErrPermissionDenied) {
+		t.Fatalf("AcknowledgeRotation(ungranted runtime) error = %v, want permission denied", err)
+	}
+	if err := service.AcknowledgeRotation(runtimeContext, wrongAcknowledgement); !errors.Is(err, domain.ErrRotationMismatch) {
+		t.Fatalf("AcknowledgeRotation(wrong reference) error = %v, want mismatch", err)
+	}
+	if driver.finalizeCalls != 0 {
+		t.Fatalf("driver finalized %d times after mismatched acknowledgement", driver.finalizeCalls)
+	}
+	acknowledgement := wrongAcknowledgement
+	acknowledgement.SecretReference = pending.SecretReference
+	if err := service.AcknowledgeRotation(runtimeContext, acknowledgement); !errors.Is(err, ErrRotationReconciliation) {
+		t.Fatalf("AcknowledgeRotation(first cutover attempt) error = %v, want reconciliation", err)
+	}
+	if driver.finalizeCalls != 1 {
+		t.Fatalf("finalization calls = %d, want 1", driver.finalizeCalls)
+	}
+	if _, exists := secretStore.values[oldReference]; !exists {
+		t.Fatal("old credential was removed after a failed target cutover")
+	}
+	if _, exists := secretStore.values[pending.SecretReference]; !exists {
+		t.Fatal("new credential was removed after a failed target cutover")
+	}
+	resource, err := store.GetResource(context.Background(), created.ID)
+	if err != nil || resource.RotationStatus != domain.RotationReconciliationRequired {
+		t.Fatalf("resource after failed cutover = %+v, %v", resource, err)
+	}
+	if err := service.AcknowledgeRotation(runtimeContext, acknowledgement); err != nil {
+		t.Fatalf("AcknowledgeRotation(retry) error = %v", err)
+	}
+	if driver.finalizeCalls != 2 {
+		t.Fatalf("finalization calls = %d, want 2 after retry", driver.finalizeCalls)
+	}
+	if _, exists := secretStore.values[oldReference]; exists {
+		t.Fatal("old credential remained after successful retry acknowledgement")
+	}
+	if _, exists := secretStore.values[pending.SecretReference]; !exists {
+		t.Fatal("new credential was removed after successful retry acknowledgement")
+	}
+	resource, err = store.GetResource(context.Background(), created.ID)
+	if err != nil || resource.CredentialGeneration != 2 || resource.SecretURI != pending.SecretReference || resource.RotationStatus != "" {
+		t.Fatalf("resource after adoption = %+v, %v", resource, err)
+	}
+	if err := service.AcknowledgeRotation(runtimeContext, acknowledgement); err != nil || driver.finalizeCalls != 2 {
+		t.Fatalf("idempotent acknowledgement error=%v, finalization calls=%d", err, driver.finalizeCalls)
+	}
+	replayedReceipt, err := service.Rotate(callerContext, command)
+	if err != nil || replayedReceipt.OperationID != receipt.OperationID || driver.stageCalls != 1 {
+		t.Fatalf("idempotent Rotate() = %+v, %v; stage calls=%d", replayedReceipt, err, driver.stageCalls)
+	}
+	if _, err := service.Revoke(callerContext, domain.RevokeResourceCommand{
+		ResourceID:   created.ID,
+		Confirmation: "revoke:" + created.ID,
+	}, "rotation-revoke-001"); err != nil {
+		t.Fatalf("Revoke(after rotation) error = %v", err)
+	}
+	if len(driver.lastRevokedGenerations) != 2 || driver.lastRevokedGenerations[0] != 1 || driver.lastRevokedGenerations[1] != 2 {
+		t.Fatalf("revoke received credential generations %v, want [1 2]", driver.lastRevokedGenerations)
+	}
+}
+
+func TestFailedRotationReplayReturnsRotationFailureNotPersistenceFailure(t *testing.T) {
+	t.Parallel()
+
+	store := openTestStore(t)
+	grantTestActions(t, store, authorization.ActionCreateResource, authorization.ActionRotateResource)
+	driver := &testDriver{stageErrors: []error{NewDriverFailure("TARGET_UNAVAILABLE", false)}}
+	service := newTestService(t, store, driver, newTestSecretStore())
+	ctx := identity.WithPrincipal(context.Background(), identity.Principal{Subject: "caller-subject", Transport: identity.TransportHTTP})
+	resource, err := service.Create(ctx, domain.CreateResourceCommand{
+		ResourceType:   domain.ResourceValkey,
+		Scope:          domain.Scope{Application: "orders", Environment: "production"},
+		IdempotencyKey: "rotation-failed-create-001",
+	})
+	if err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+	command := domain.RotateResourceCommand{ResourceID: resource.ID, IdempotencyKey: "rotation-failed-001"}
+	if _, err := service.Rotate(ctx, command); !errors.Is(err, ErrRotationFailed) {
+		t.Fatalf("Rotate(first attempt) error = %v, want rotation failure", err)
+	}
+	if _, err := service.Rotate(ctx, command); !errors.Is(err, ErrRotationFailed) {
+		t.Fatalf("Rotate(idempotent replay) error = %v, want rotation failure", err)
+	}
+	if driver.stageCalls != 1 {
+		t.Fatalf("stage calls after idempotent replay = %d, want 1", driver.stageCalls)
+	}
+}
+
 func TestCreateRetriesKnownFailureWithSameIdempotencyKey(t *testing.T) {
 	t.Parallel()
 
@@ -185,11 +339,18 @@ func TestCreateDeniesWithoutGrantAndDoesNotCallDriver(t *testing.T) {
 }
 
 type testDriver struct {
-	createCalls    int
-	revokeCalls    int
-	createErrors   []error
-	revokeErrors   []error
-	lastCredential []byte
+	createCalls            int
+	revokeCalls            int
+	stageCalls             int
+	finalizeCalls          int
+	abortCalls             int
+	createErrors           []error
+	revokeErrors           []error
+	stageErrors            []error
+	finalizeErrors         []error
+	abortErrors            []error
+	lastCredential         []byte
+	lastRevokedGenerations []int64
 }
 
 func (driver *testDriver) Create(_ context.Context, resource domain.Resource) (Credential, error) {
@@ -207,13 +368,49 @@ func (driver *testDriver) Create(_ context.Context, resource domain.Resource) (C
 	return Credential{Name: credentialName(resource.ResourceType), Value: value}, nil
 }
 
-func (driver *testDriver) Revoke(context.Context, domain.Resource) error {
+func (driver *testDriver) Revoke(_ context.Context, resource domain.Resource) error {
 	driver.revokeCalls++
+	driver.lastRevokedGenerations = append(driver.lastRevokedGenerations[:0], resource.CredentialGenerations...)
 	if len(driver.revokeErrors) == 0 {
 		return nil
 	}
 	err := driver.revokeErrors[0]
 	driver.revokeErrors = driver.revokeErrors[1:]
+	return err
+}
+
+func (driver *testDriver) StageRotation(_ context.Context, resource domain.Resource, _ int64) (Credential, error) {
+	driver.stageCalls++
+	if len(driver.stageErrors) > 0 {
+		err := driver.stageErrors[0]
+		driver.stageErrors = driver.stageErrors[1:]
+		return Credential{}, err
+	}
+	value := make([]byte, 32)
+	if _, err := rand.Read(value); err != nil {
+		return Credential{}, err
+	}
+	driver.lastCredential = append(driver.lastCredential[:0], value...)
+	return Credential{Name: credentialName(resource.ResourceType), Value: value}, nil
+}
+
+func (driver *testDriver) FinalizeRotation(context.Context, domain.Resource, int64, int64, []int64) error {
+	driver.finalizeCalls++
+	if len(driver.finalizeErrors) == 0 {
+		return nil
+	}
+	err := driver.finalizeErrors[0]
+	driver.finalizeErrors = driver.finalizeErrors[1:]
+	return err
+}
+
+func (driver *testDriver) AbortRotation(context.Context, domain.Resource, int64) error {
+	driver.abortCalls++
+	if len(driver.abortErrors) == 0 {
+		return nil
+	}
+	err := driver.abortErrors[0]
+	driver.abortErrors = driver.abortErrors[1:]
 	return err
 }
 
@@ -262,7 +459,7 @@ func (store *testSecretStore) Delete(_ context.Context, reference secrets.Refere
 func openTestStore(t *testing.T) *sqlite.Store {
 	t.Helper()
 
-	store, err := sqlite.Open(filepath.Join(t.TempDir(), "control.db"))
+	store, err := sqlite.Open(filepath.Join(t.TempDir(), "database", "control.db"))
 	if err != nil {
 		t.Fatalf("sqlite.Open() error = %v", err)
 	}

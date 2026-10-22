@@ -26,4 +26,5 @@ SRP_TEST_VALKEY_URL="redis://@127.0.0.1:${valkey_port}/0" \
 	go test -tags=integration -count=1 \
 		./internal/drivers/postgresql \
 		./internal/drivers/valkey \
-		./internal/drivers/nats
+		./internal/drivers/nats \
+		./internal/provisioning

@@ -31,6 +31,30 @@ func TestResourceNamesUseDistinctUserAndScopedKeyChannelPrefixes(t *testing.T) {
 	}
 }
 
+func TestResourceNamesUseDistinctUsersForCredentialGenerations(t *testing.T) {
+	t.Parallel()
+
+	resource := domain.Resource{
+		ID:           "rotation-resource-id",
+		ResourceType: domain.ResourceValkey,
+		Scope:        domain.Scope{Application: "orders", Environment: "production"},
+	}
+	firstUser, firstKeys, firstChannels, err := resourceNamesForGeneration(resource, 1)
+	if err != nil {
+		t.Fatalf("resourceNamesForGeneration(1) error = %v", err)
+	}
+	secondUser, secondKeys, secondChannels, err := resourceNamesForGeneration(resource, 2)
+	if err != nil {
+		t.Fatalf("resourceNamesForGeneration(2) error = %v", err)
+	}
+	if firstUser == secondUser || firstKeys != secondKeys || firstChannels != secondChannels || len(secondUser) > 64 {
+		t.Fatalf("generation names = (%q,%q), key patterns=(%q,%q), channel patterns=(%q,%q)", firstUser, secondUser, firstKeys, secondKeys, firstChannels, secondChannels)
+	}
+	if _, _, _, err := resourceNamesForGeneration(resource, 10_000_000_000_000); err == nil {
+		t.Fatal("resourceNamesForGeneration() accepted an out-of-range generation")
+	}
+}
+
 func TestACLArgumentsContainOnlyScopedRulesAndAllowedCommands(t *testing.T) {
 	t.Parallel()
 

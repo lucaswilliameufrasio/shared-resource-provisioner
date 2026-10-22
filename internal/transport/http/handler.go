@@ -24,12 +24,16 @@ func NewHandler(
 	logger *slog.Logger,
 	grantManager authorization.GrantManager,
 	adminSubjects []string,
+	rotation ...RuntimeRotation,
 ) (http.Handler, error) {
 	if server == nil || verifier == nil || issuerURL == "" || logger == nil || grantManager == nil {
 		return nil, errors.New("MCP server, token verifier, issuer, logger, and grant manager are required")
 	}
 	if len(adminSubjects) == 0 {
 		return nil, errors.New("at least one OIDC admin subject is required")
+	}
+	if len(rotation) > 1 {
+		return nil, errors.New("at most one runtime rotation service is allowed")
 	}
 	seenAdminSubjects := make(map[string]struct{}, len(adminSubjects))
 	for _, subject := range adminSubjects {
@@ -64,6 +68,11 @@ func NewHandler(
 		return nil, err
 	}
 	protectedAdmin := http.NewCrossOriginProtection().Handler(RequireAdminBearerToken(verifier, metadataURL, adminSubjects, adminHandler))
+	var protectedRuntime http.Handler
+	if len(rotation) == 1 && rotation[0] != nil {
+		runtimeHandler := newRuntimeRotationHandler(rotation[0])
+		protectedRuntime = http.NewCrossOriginProtection().Handler(RequireBearerToken(verifier, metadataURL, runtimeHandler))
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(writer http.ResponseWriter, _ *http.Request) {
@@ -73,6 +82,9 @@ func NewHandler(
 	})
 	mux.Handle(resourcePath, protectedMCP)
 	mux.Handle("/v1/admin/", protectedAdmin)
+	if protectedRuntime != nil {
+		mux.Handle("/v1/runtime/", protectedRuntime)
+	}
 	mux.Handle(metadata.EscapedPath(), auth.ProtectedResourceMetadataHandler(&oauthex.ProtectedResourceMetadata{
 		Resource:               resourceURL,
 		AuthorizationServers:   []string{issuerURL},

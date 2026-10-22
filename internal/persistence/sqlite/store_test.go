@@ -17,7 +17,7 @@ import (
 func TestGrantAndAuditPersistAcrossReopen(t *testing.T) {
 	t.Parallel()
 
-	databasePath := filepath.Join(t.TempDir(), "control.db")
+	databasePath := filepath.Join(t.TempDir(), "database", "control.db")
 	store, err := Open(databasePath)
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
@@ -180,7 +180,11 @@ func TestAuditEventsRejectUpdateAndDelete(t *testing.T) {
 func TestOpenRejectsDatabaseWithBroadPermissions(t *testing.T) {
 	t.Parallel()
 
-	databasePath := filepath.Join(t.TempDir(), "control.db")
+	databaseDirectory := filepath.Join(t.TempDir(), "database")
+	if err := os.Mkdir(databaseDirectory, 0o700); err != nil {
+		t.Fatalf("Mkdir(database directory) error = %v", err)
+	}
+	databasePath := filepath.Join(databaseDirectory, "control.db")
 	if err := os.WriteFile(databasePath, []byte("not a database"), 0o644); err != nil {
 		t.Fatalf("WriteFile() error = %v", err)
 	}
@@ -189,6 +193,22 @@ func TestOpenRejectsDatabaseWithBroadPermissions(t *testing.T) {
 	}
 	if _, err := Open(databasePath); !errors.Is(err, ErrInsecureDatabase) {
 		t.Fatalf("Open() error = %v, want ErrInsecureDatabase", err)
+	}
+}
+
+func TestOpenRejectsDatabaseInSharedDirectory(t *testing.T) {
+	t.Parallel()
+
+	databaseDirectory := t.TempDir()
+	if err := os.Chmod(databaseDirectory, 0o755); err != nil {
+		t.Fatalf("Chmod(database directory) error = %v", err)
+	}
+	databasePath := filepath.Join(databaseDirectory, "control.db")
+	if _, err := Open(databasePath); !errors.Is(err, ErrInsecureDatabase) {
+		t.Fatalf("Open(shared directory) error = %v, want ErrInsecureDatabase", err)
+	}
+	if _, err := os.Stat(databasePath); !os.IsNotExist(err) {
+		t.Fatalf("Stat(database after rejected open) error = %v, want not found", err)
 	}
 }
 
@@ -363,6 +383,12 @@ func TestGrantChangesRollBackWhenAuditAppendFails(t *testing.T) {
 func mustOpen(t *testing.T, path string) *Store {
 	t.Helper()
 
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("MkdirAll(database directory) error = %v", err)
+	}
+	if err := os.Chmod(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("Chmod(database directory) error = %v", err)
+	}
 	store, err := Open(path)
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)

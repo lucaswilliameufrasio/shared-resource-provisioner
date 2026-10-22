@@ -95,8 +95,7 @@ func (driver *Driver) Create(ctx context.Context, resource domain.Resource) (pro
 }
 
 func (driver *Driver) Revoke(ctx context.Context, resource domain.Resource) error {
-	username, _, _, err := resourceNames(resource)
-	if err != nil {
+	if _, _, _, err := resourceNames(resource); err != nil {
 		return provisioning.NewDriverFailure("INVALID_RESOURCE_METADATA", false)
 	}
 	client, _, err := driver.adminClient()
@@ -109,8 +108,14 @@ func (driver *Driver) Revoke(ctx context.Context, resource domain.Resource) erro
 	if err := client.Ping(ctx).Err(); err != nil {
 		return provisioning.NewDriverFailure("TARGET_UNAVAILABLE", true)
 	}
-	if err := client.Do(ctx, "ACL", "DELUSER", username).Err(); err != nil {
-		return provisioning.NewDriverFailure("DRIVER_FAILURE", true)
+	for _, generation := range credentialGenerations(resource) {
+		username, _, _, err := resourceNamesForGeneration(resource, generation)
+		if err != nil {
+			return provisioning.NewDriverFailure("INVALID_RESOURCE_METADATA", false)
+		}
+		if err := client.Do(ctx, "ACL", "DELUSER", username).Err(); err != nil {
+			return provisioning.NewDriverFailure("DRIVER_FAILURE", true)
+		}
 	}
 	return nil
 }

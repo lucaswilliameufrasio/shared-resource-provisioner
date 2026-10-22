@@ -139,6 +139,81 @@ func TestDriverProvisionsIsolatesLimitsAndRevokesAgainstLocalNATS(t *testing.T) 
 	if err := driver.Revoke(context.Background(), resource); err != nil {
 		t.Fatalf("Revoke(retry) error = %v", err)
 	}
+
+	rotatingResource := domain.Resource{
+		ID:                    "local-rotation-resource",
+		ResourceType:          domain.ResourceNATS,
+		Scope:                 domain.Scope{Application: "rotation", Environment: "test"},
+		CredentialGeneration:  1,
+		CredentialGenerations: []int64{1, 2},
+	}
+	generationOne, err := driver.Create(context.Background(), rotatingResource)
+	if err != nil {
+		t.Fatalf("Create(rotation resource) error = %v", err)
+	}
+	defer clear(generationOne.Value)
+	generationTwo, err := driver.StageRotation(context.Background(), rotatingResource, 2)
+	if err != nil {
+		t.Fatalf("StageRotation(generation two) error = %v", err)
+	}
+	defer clear(generationTwo.Value)
+	oldClient := connectResourceUser(t, endpoint, generationOne.Value)
+	if err := oldClient.FlushTimeout(5 * time.Second); err != nil {
+		oldClient.Close()
+		t.Fatalf("FlushTimeout(old before cutover) error = %v", err)
+	}
+	oldClient.Close()
+	stagedClient := connectResourceUser(t, endpoint, generationTwo.Value)
+	stagedClient.Close()
+	if err := driver.FinalizeRotation(context.Background(), rotatingResource, 1, 2, []int64{1, 2}); err != nil {
+		t.Fatalf("FinalizeRotation(generation two) error = %v", err)
+	}
+	if _, err := openResourceUser(endpoint, generationOne.Value); err == nil {
+		t.Fatal("NATS accepted the old rotation credential after acknowledgement")
+	}
+	if client := connectResourceUser(t, endpoint, generationTwo.Value); client == nil {
+		t.Fatal("NATS rejected the adopted rotation credential")
+	} else {
+		client.Close()
+	}
+
+	rotatingResource.CredentialGeneration = 2
+	rotatingResource.CredentialGenerations = []int64{1, 2, 3}
+	generationThree, err := driver.StageRotation(context.Background(), rotatingResource, 3)
+	if err != nil {
+		t.Fatalf("StageRotation(generation three) error = %v", err)
+	}
+	defer clear(generationThree.Value)
+	if _, err := openResourceUser(endpoint, generationOne.Value); err == nil {
+		t.Fatal("a later rotation removed the prior generation-one NATS revocation")
+	}
+	if client := connectResourceUser(t, endpoint, generationTwo.Value); client == nil {
+		t.Fatal("staging generation three revoked the current NATS user too early")
+	} else {
+		client.Close()
+	}
+	if client := connectResourceUser(t, endpoint, generationThree.Value); client == nil {
+		t.Fatal("staged generation-three NATS user was not accepted")
+	} else {
+		client.Close()
+	}
+	if err := driver.FinalizeRotation(context.Background(), rotatingResource, 2, 3, []int64{1, 2, 3}); err != nil {
+		t.Fatalf("FinalizeRotation(generation three) error = %v", err)
+	}
+	if _, err := openResourceUser(endpoint, generationOne.Value); err == nil {
+		t.Fatal("finalizing a later rotation removed the generation-one revocation")
+	}
+	if _, err := openResourceUser(endpoint, generationTwo.Value); err == nil {
+		t.Fatal("NATS accepted the superseded generation-two credential after acknowledgement")
+	}
+	if client := connectResourceUser(t, endpoint, generationThree.Value); client == nil {
+		t.Fatal("NATS rejected the latest adopted credential")
+	} else {
+		client.Close()
+	}
+	if err := driver.Revoke(context.Background(), rotatingResource); err != nil {
+		t.Fatalf("Revoke(rotation resource) error = %v", err)
+	}
 }
 
 func startLocalNATS(t *testing.T) (string, []byte, []byte, func()) {

@@ -13,12 +13,15 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+const httpShutdownGracePeriod = 60 * time.Second
+
 func Serve(
 	ctx context.Context,
 	settings config.Settings,
 	server *mcp.Server,
 	grants authorization.GrantManager,
 	logger *slog.Logger,
+	rotation ...RuntimeRotation,
 ) error {
 	if err := settings.ValidateHTTP(); err != nil {
 		return err
@@ -27,7 +30,7 @@ func Serve(
 	if err != nil {
 		return err
 	}
-	handler, err := NewHandler(server, verifier, settings.MCPResourceURL, settings.OIDCIssuerURL, logger, grants, settings.AdminSubjects)
+	handler, err := NewHandler(server, verifier, settings.MCPResourceURL, settings.OIDCIssuerURL, logger, grants, settings.AdminSubjects, rotation...)
 	if err != nil {
 		return err
 	}
@@ -60,9 +63,8 @@ func Serve(
 		}
 		return errors.New("HTTP server stopped unexpectedly")
 	case <-ctx.Done():
-		shutdownContext, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := httpServer.Shutdown(shutdownContext); err != nil {
+		if err := shutdownHTTPServer(httpServer, httpShutdownGracePeriod); err != nil {
+			_ = httpServer.Close()
 			return errors.New("HTTP server shutdown failed")
 		}
 		err := <-serveResult
@@ -71,4 +73,10 @@ func Serve(
 		}
 		return errors.New("HTTP server stopped unexpectedly")
 	}
+}
+
+func shutdownHTTPServer(server *http.Server, timeout time.Duration) error {
+	shutdownContext, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return server.Shutdown(shutdownContext)
 }

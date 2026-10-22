@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -30,17 +32,29 @@ var (
 	ErrProvisioningFailed       = errors.New("PROVISIONING_FAILED")
 	ErrReconciliationRequired   = errors.New("RECONCILIATION_REQUIRED")
 	ErrRevocationFailed         = errors.New("REVOCATION_REQUIRES_RECONCILIATION")
+	ErrRotationFailed           = errors.New("ROTATION_FAILED")
+	ErrRotationReconciliation   = errors.New("ROTATION_REQUIRES_RECONCILIATION")
 	ErrInvalidResourceReference = errors.New("INVALID_RESOURCE_REFERENCE")
 )
 
 type ResourceStore interface {
 	ReserveCreate(context.Context, domain.Operation, domain.Resource, int, audit.Event) (domain.Operation, domain.Resource, bool, error)
 	ReserveRevoke(context.Context, domain.Operation, string, audit.Event) (domain.Operation, domain.Resource, bool, error)
+	ReserveRotation(context.Context, domain.Operation, string, int64, string, string, string, audit.Event) (domain.Operation, domain.Resource, domain.Rotation, bool, error)
 	ClaimOperation(context.Context, string, time.Time, time.Duration, int, audit.Event) (domain.Operation, domain.Resource, error)
 	CompleteCreate(context.Context, string, string, string, audit.Event) (domain.Resource, error)
+	CompleteRotationStage(context.Context, string, audit.Event) (domain.Rotation, error)
 	FailCreate(context.Context, string, string, bool, audit.Event) error
 	CompleteRevoke(context.Context, string, audit.Event) (domain.Resource, error)
 	FailRevoke(context.Context, string, string, audit.Event) error
+	FailRotationStage(context.Context, string, string, bool, audit.Event) error
+	GetRotation(context.Context, string, string) (domain.Rotation, error)
+	GetPendingRotation(context.Context, string) (domain.Rotation, error)
+	ClaimRotationFinalization(context.Context, domain.RotationAcknowledgement, time.Time, time.Duration, audit.Event) (domain.Rotation, domain.Resource, error)
+	CompleteRotationFinalization(context.Context, string, audit.Event) (domain.Resource, error)
+	FailRotationFinalization(context.Context, string, string, audit.Event) error
+	ListRotationHistory(context.Context, string) ([]domain.Rotation, error)
+	ListCredentialGenerations(context.Context, string) ([]int64, error)
 	GetResource(context.Context, string) (domain.Resource, error)
 	GetOperationByIdempotencyKey(context.Context, string, string) (domain.Operation, error)
 	Record(context.Context, audit.Event) error
@@ -99,6 +113,9 @@ func NewService(
 		}
 		if _, exists := service.targetsByType[target.ResourceType]; exists {
 			return nil, errors.New("only one target per resource type is supported")
+		}
+		if _, ok := target.Driver.(RotationDriver); !ok {
+			return nil, errors.New("service target must support staged credential rotation")
 		}
 		service.targetsByID[target.ID] = target
 		service.targetsByType[target.ResourceType] = target
@@ -238,6 +255,322 @@ func (service *Service) Inspect(ctx context.Context, resourceID string) (domain.
 	return resource.View(), nil
 }
 
+func (service *Service) Rotate(ctx context.Context, command domain.RotateResourceCommand) (domain.RotationReceipt, error) {
+	if err := domain.ValidateRotateResourceCommand(command); err != nil {
+		return domain.RotationReceipt{}, err
+	}
+	principal, ok := identity.FromContext(ctx)
+	if !ok {
+		return domain.RotationReceipt{}, ErrUnauthenticated
+	}
+	resource, err := service.store.GetResource(ctx, command.ResourceID)
+	if err != nil {
+		event := service.event(principal, authorization.ActionRotateResource, domain.Scope{}, "")
+		event.EntityID = command.ResourceID
+		return domain.RotationReceipt{}, service.recordMappedFailure(ctx, principal, event, err)
+	}
+	event := service.event(principal, authorization.ActionRotateResource, resource.Scope, resource.ResourceType)
+	event.EntityID = resource.ID
+	if err := service.authorize(ctx, principal, authorization.ActionRotateResource, resource.Scope, event); err != nil {
+		return domain.RotationReceipt{}, err
+	}
+	target, exists := service.targetsByID[resource.TargetID]
+	if !exists || target.ResourceType != resource.ResourceType {
+		return domain.RotationReceipt{}, ErrTargetUnavailable
+	}
+	rotationDriver, ok := target.Driver.(RotationDriver)
+	if !ok {
+		return domain.RotationReceipt{}, ErrTargetUnavailable
+	}
+	credentialGenerations, err := service.store.ListCredentialGenerations(ctx, resource.ID)
+	if err != nil {
+		return domain.RotationReceipt{}, ErrPersistenceUnavailable
+	}
+	newGeneration := resource.CredentialGeneration + 1
+	for _, generation := range credentialGenerations {
+		if generation >= newGeneration {
+			newGeneration = generation + 1
+		}
+	}
+	if newGeneration < 2 || newGeneration > 9_999_999_999_999 {
+		return domain.RotationReceipt{}, domain.ErrInvalidResourceTransition
+	}
+	secretName, err := rotationSecretName(resource.ResourceType, newGeneration)
+	if err != nil {
+		return domain.RotationReceipt{}, err
+	}
+	expectedReference, err := service.secretStore.ReferenceFor(resource.Scope, secretName)
+	if err != nil {
+		return domain.RotationReceipt{}, ErrSecretStoreUnavailable
+	}
+	secretVersion := "generation-" + strconv.FormatInt(newGeneration, 10)
+	requestHash := hashRequest(resource.ID, resource.TargetID, "rotate")
+	operation := domain.Operation{
+		IdempotencyKey: command.IdempotencyKey,
+		Subject:        principal.Subject,
+		Action:         domain.ActionRotateResource,
+		RequestHash:    requestHash,
+	}
+	operation, resource, rotation, wasExisting, err := service.store.ReserveRotation(
+		ctx, operation, resource.ID, newGeneration, credentialName(resource.ResourceType),
+		expectedReference.URI, secretVersion, event,
+	)
+	if err != nil {
+		return domain.RotationReceipt{}, service.recordMappedFailure(ctx, principal, event, err)
+	}
+	newGeneration = rotation.NewGeneration
+	expectedReference = secrets.Reference{URI: rotation.SecretURI, Version: rotation.SecretVersion}
+	if err := secrets.ValidateReference(expectedReference); err != nil {
+		return domain.RotationReceipt{}, ErrPersistenceUnavailable
+	}
+	resource.CredentialGenerations = append(credentialGenerations, newGeneration)
+	if operation.Status == domain.OperationSucceeded {
+		return rotationReceipt(rotation), nil
+	}
+	operation, resource, err = service.store.ClaimOperation(
+		ctx, operation.ID, service.now().UTC(), service.operationLease,
+		target.MaxConcurrentOperations, event,
+	)
+	if err != nil {
+		return domain.RotationReceipt{}, service.recordMappedFailure(ctx, principal, event, err)
+	}
+	if operation.Status == domain.OperationSucceeded {
+		rotation, err = service.store.GetRotation(ctx, resource.ID, operation.ID)
+		if err != nil {
+			return domain.RotationReceipt{}, ErrPersistenceUnavailable
+		}
+		return rotationReceipt(rotation), nil
+	}
+
+	operationCtx, cancel := context.WithTimeout(ctx, service.operationTimeout)
+	defer cancel()
+	if wasExisting {
+		if err := service.secretStore.Delete(operationCtx, expectedReference); err != nil {
+			if failErr := service.store.FailRotationStage(ctx, operation.ID, "SECRET_CLEANUP_FAILED", true, event); failErr != nil {
+				return domain.RotationReceipt{}, ErrPersistenceUnavailable
+			}
+			return domain.RotationReceipt{}, ErrRotationReconciliation
+		}
+	}
+	credential, driverErr := rotationDriver.StageRotation(operationCtx, resource, newGeneration)
+	if driverErr != nil {
+		code, mayHaveMutated := failureDetails(driverErr)
+		cleanupFailed := false
+		if mayHaveMutated {
+			cleanupFailed = service.cleanupRotationStage(ctx, rotationDriver, resource, newGeneration, expectedReference) != nil
+		}
+		if err := service.store.FailRotationStage(ctx, operation.ID, code, cleanupFailed, event); err != nil {
+			return domain.RotationReceipt{}, ErrPersistenceUnavailable
+		}
+		if cleanupFailed {
+			return domain.RotationReceipt{}, ErrRotationReconciliation
+		}
+		return domain.RotationReceipt{}, ErrRotationFailed
+	}
+	defer clear(credential.Value)
+	if !secrets.ValidName(credential.Name) || credential.Name != credentialName(resource.ResourceType) || len(credential.Value) == 0 {
+		cleanupFailed := service.cleanupRotationStage(ctx, rotationDriver, resource, newGeneration, expectedReference) != nil
+		if err := service.store.FailRotationStage(ctx, operation.ID, "DRIVER_FAILURE", cleanupFailed, event); err != nil {
+			return domain.RotationReceipt{}, ErrPersistenceUnavailable
+		}
+		if cleanupFailed {
+			return domain.RotationReceipt{}, ErrRotationReconciliation
+		}
+		return domain.RotationReceipt{}, ErrRotationFailed
+	}
+	storedReference, err := service.secretStore.Put(operationCtx, resource.Scope, secretName, credential.Value)
+	if err != nil {
+		cleanupFailed := service.cleanupRotationStage(ctx, rotationDriver, resource, newGeneration, expectedReference) != nil
+		if err := service.store.FailRotationStage(ctx, operation.ID, "SECRET_STORE_UNAVAILABLE", cleanupFailed, event); err != nil {
+			return domain.RotationReceipt{}, ErrPersistenceUnavailable
+		}
+		if cleanupFailed {
+			return domain.RotationReceipt{}, ErrRotationReconciliation
+		}
+		return domain.RotationReceipt{}, ErrRotationFailed
+	}
+	if err := secrets.ValidateReference(storedReference); err != nil || storedReference.URI != expectedReference.URI {
+		cleanupReference := expectedReference
+		if secrets.ValidateReference(storedReference) == nil {
+			cleanupReference = storedReference
+		}
+		cleanupFailed := service.cleanupRotationStage(ctx, rotationDriver, resource, newGeneration, cleanupReference) != nil
+		if err := service.store.FailRotationStage(ctx, operation.ID, "INVALID_SECRET_REFERENCE", cleanupFailed, event); err != nil {
+			return domain.RotationReceipt{}, ErrPersistenceUnavailable
+		}
+		if cleanupFailed {
+			return domain.RotationReceipt{}, ErrRotationReconciliation
+		}
+		return domain.RotationReceipt{}, ErrRotationFailed
+	}
+	storedReference.Version = secretVersion
+	rotation, err = service.store.CompleteRotationStage(ctx, operation.ID, event)
+	if err != nil {
+		current, readErr := service.store.GetRotation(ctx, resource.ID, operation.ID)
+		if readErr == nil && current.Status == domain.RotationPending {
+			return rotationReceipt(current), nil
+		}
+		cleanupFailed := service.cleanupRotationStage(ctx, rotationDriver, resource, newGeneration, storedReference) != nil
+		if failErr := service.store.FailRotationStage(ctx, operation.ID, "PERSISTENCE_UNAVAILABLE", cleanupFailed, event); failErr != nil {
+			return domain.RotationReceipt{}, ErrPersistenceUnavailable
+		}
+		if cleanupFailed {
+			return domain.RotationReceipt{}, ErrRotationReconciliation
+		}
+		return domain.RotationReceipt{}, ErrPersistenceUnavailable
+	}
+	return rotationReceipt(rotation), nil
+}
+
+func (service *Service) PendingRotation(ctx context.Context, resourceID string) (domain.PendingRotation, error) {
+	if resourceID == "" || len(resourceID) > 128 || strings.TrimSpace(resourceID) != resourceID {
+		return domain.PendingRotation{}, domain.ErrResourceNotFound
+	}
+	principal, ok := identity.FromContext(ctx)
+	if !ok {
+		return domain.PendingRotation{}, ErrUnauthenticated
+	}
+	resource, err := service.store.GetResource(ctx, resourceID)
+	if err != nil {
+		event := service.event(principal, authorization.ActionAdoptRotation, domain.Scope{}, "")
+		event.EntityID = resourceID
+		return domain.PendingRotation{}, service.recordMappedFailure(ctx, principal, event, err)
+	}
+	event := service.event(principal, authorization.ActionAdoptRotation, resource.Scope, resource.ResourceType)
+	event.EntityID = resource.ID
+	if err := service.authorize(ctx, principal, authorization.ActionAdoptRotation, resource.Scope, event); err != nil {
+		return domain.PendingRotation{}, err
+	}
+	rotation, err := service.store.GetPendingRotation(ctx, resource.ID)
+	if err != nil {
+		return domain.PendingRotation{}, service.recordMappedFailure(ctx, principal, event, err)
+	}
+	if err := service.record(ctx, event, audit.OutcomeAllowed, ""); err != nil {
+		return domain.PendingRotation{}, err
+	}
+	return domain.PendingRotation{
+		ResourceID:      rotation.ResourceID,
+		OperationID:     rotation.OperationID,
+		CredentialName:  rotation.CredentialName,
+		SecretReference: rotation.SecretURI,
+		SecretVersion:   rotation.SecretVersion,
+		Generation:      rotation.NewGeneration,
+		Status:          rotation.Status,
+	}, nil
+}
+
+func (service *Service) AcknowledgeRotation(ctx context.Context, acknowledgement domain.RotationAcknowledgement) error {
+	if acknowledgement.ResourceID == "" || acknowledgement.OperationID == "" || acknowledgement.SecretReference == "" || acknowledgement.Generation < 2 {
+		return domain.ErrRotationMismatch
+	}
+	principal, ok := identity.FromContext(ctx)
+	if !ok {
+		return ErrUnauthenticated
+	}
+	resource, err := service.store.GetResource(ctx, acknowledgement.ResourceID)
+	if err != nil {
+		event := service.event(principal, authorization.ActionAdoptRotation, domain.Scope{}, "")
+		event.EntityID = acknowledgement.ResourceID
+		return service.recordMappedFailure(ctx, principal, event, err)
+	}
+	event := service.event(principal, authorization.ActionAdoptRotation, resource.Scope, resource.ResourceType)
+	event.EntityID = resource.ID
+	if err := service.authorize(ctx, principal, authorization.ActionAdoptRotation, resource.Scope, event); err != nil {
+		return err
+	}
+	rotation, resource, err := service.store.ClaimRotationFinalization(
+		ctx, acknowledgement, service.now().UTC(), service.operationLease, event,
+	)
+	if err != nil {
+		return service.recordMappedFailure(ctx, principal, event, err)
+	}
+	if rotation.Status == domain.RotationCompleted {
+		return nil
+	}
+	target, exists := service.targetsByID[resource.TargetID]
+	if !exists || target.ResourceType != resource.ResourceType {
+		_ = service.store.FailRotationFinalization(ctx, rotation.OperationID, "TARGET_UNAVAILABLE", event)
+		return ErrRotationReconciliation
+	}
+	rotationDriver, ok := target.Driver.(RotationDriver)
+	if !ok {
+		_ = service.store.FailRotationFinalization(ctx, rotation.OperationID, "TARGET_UNAVAILABLE", event)
+		return ErrRotationReconciliation
+	}
+	generations, err := service.store.ListCredentialGenerations(ctx, resource.ID)
+	if err != nil {
+		_ = service.store.FailRotationFinalization(ctx, rotation.OperationID, "PERSISTENCE_UNAVAILABLE", event)
+		return ErrPersistenceUnavailable
+	}
+	operationCtx, cancel := context.WithTimeout(ctx, service.operationTimeout)
+	defer cancel()
+	if err := rotationDriver.FinalizeRotation(operationCtx, resource, rotation.OldGeneration, rotation.NewGeneration, generations); err != nil {
+		_ = service.store.FailRotationFinalization(ctx, rotation.OperationID, "TARGET_FINALIZATION_FAILED", event)
+		return ErrRotationReconciliation
+	}
+	oldReference := secrets.Reference{URI: rotation.OldSecretURI, Version: rotation.OldSecretVersion}
+	if err := secrets.ValidateReference(oldReference); err != nil || service.secretStore.Delete(operationCtx, oldReference) != nil {
+		_ = service.store.FailRotationFinalization(ctx, rotation.OperationID, "SECRET_CLEANUP_FAILED", event)
+		return ErrRotationReconciliation
+	}
+	if _, err := service.store.CompleteRotationFinalization(ctx, rotation.OperationID, event); err != nil {
+		current, readErr := service.store.GetResource(ctx, resource.ID)
+		if readErr == nil && current.CredentialGeneration == rotation.NewGeneration && current.RotationStatus == "" {
+			return nil
+		}
+		_ = service.store.FailRotationFinalization(ctx, rotation.OperationID, "PERSISTENCE_UNAVAILABLE", event)
+		return ErrRotationReconciliation
+	}
+	return nil
+}
+
+func (service *Service) cleanupRotationStage(
+	ctx context.Context,
+	driver RotationDriver,
+	resource domain.Resource,
+	generation int64,
+	reference secrets.Reference,
+) error {
+	cleanupCtx, cancel := service.backgroundContext(ctx)
+	defer cancel()
+	if err := service.secretStore.Delete(cleanupCtx, reference); err != nil {
+		return ErrSecretStoreUnavailable
+	}
+	if err := driver.AbortRotation(cleanupCtx, resource, generation); err != nil {
+		return ErrReconciliationRequired
+	}
+	return nil
+}
+
+func rotationReceipt(rotation domain.Rotation) domain.RotationReceipt {
+	return domain.RotationReceipt{
+		ResourceID:  rotation.ResourceID,
+		OperationID: rotation.OperationID,
+		Generation:  rotation.NewGeneration,
+		Status:      rotation.Status,
+		CreatedAt:   rotation.CreatedAt.UTC(),
+		UpdatedAt:   rotation.UpdatedAt.UTC(),
+	}
+}
+
+func rotationSecretName(resourceType domain.ResourceType, generation int64) (string, error) {
+	if generation < 2 || generation > 9_999_999_999_999 {
+		return "", secrets.ErrInvalidReference
+	}
+	prefix := ""
+	switch resourceType {
+	case domain.ResourcePostgreSQL:
+		prefix = "ROT_PG_"
+	case domain.ResourceValkey:
+		prefix = "ROT_VK_"
+	case domain.ResourceNATS:
+		prefix = "ROT_NS_"
+	default:
+		return "", secrets.ErrInvalidReference
+	}
+	return prefix + fmt.Sprintf("%013d", generation), nil
+}
+
 func (service *Service) Revoke(ctx context.Context, command domain.RevokeResourceCommand, idempotencyKey string) (domain.ResourceView, error) {
 	if err := domain.ValidateRevokeResourceCommand(command); err != nil || !domain.ValidIdempotencyKey(idempotencyKey) {
 		return domain.ResourceView{}, domain.ErrInvalidResourceTransition
@@ -260,6 +593,14 @@ func (service *Service) Revoke(ctx context.Context, command domain.RevokeResourc
 	target, exists := service.targetsByID[resource.TargetID]
 	if !exists || target.ResourceType != resource.ResourceType {
 		return domain.ResourceView{}, ErrTargetUnavailable
+	}
+	generations, err := service.store.ListCredentialGenerations(ctx, resource.ID)
+	if err != nil {
+		return domain.ResourceView{}, ErrPersistenceUnavailable
+	}
+	rotationHistory, err := service.store.ListRotationHistory(ctx, resource.ID)
+	if err != nil {
+		return domain.ResourceView{}, ErrPersistenceUnavailable
 	}
 	requestHash := hashRequest(resource.ID, resource.TargetID, "revoke")
 	operation := domain.Operation{
@@ -285,15 +626,35 @@ func (service *Service) Revoke(ctx context.Context, command domain.RevokeResourc
 	if operation.Status == domain.OperationSucceeded {
 		return resource.View(), nil
 	}
+	resource.CredentialGenerations = generations
 	operationCtx, cancel := context.WithTimeout(ctx, service.operationTimeout)
 	defer cancel()
 	driverErr := target.Driver.Revoke(operationCtx, resource)
 	if driverErr != nil {
 		return domain.ResourceView{}, service.failRevoke(ctx, operation, event, "DRIVER_FAILURE")
 	}
+	secretReferences := make([]secrets.Reference, 0, len(rotationHistory)*2+1)
 	if resource.SecretURI != "" {
-		reference := secrets.Reference{URI: resource.SecretURI, Version: resource.SecretVersion}
-		if err := secrets.ValidateReference(reference); err != nil || service.secretStore.Delete(operationCtx, reference) != nil {
+		secretReferences = append(secretReferences, secrets.Reference{URI: resource.SecretURI, Version: resource.SecretVersion})
+	}
+	for _, rotation := range rotationHistory {
+		if rotation.OldSecretURI != "" {
+			secretReferences = append(secretReferences, secrets.Reference{URI: rotation.OldSecretURI, Version: rotation.OldSecretVersion})
+		}
+		if rotation.SecretURI != "" {
+			secretReferences = append(secretReferences, secrets.Reference{URI: rotation.SecretURI, Version: rotation.SecretVersion})
+		}
+	}
+	deletedReferences := make(map[string]struct{}, len(secretReferences))
+	for _, reference := range secretReferences {
+		if _, exists := deletedReferences[reference.URI]; exists {
+			continue
+		}
+		deletedReferences[reference.URI] = struct{}{}
+		if err := secrets.ValidateReference(reference); err != nil {
+			return domain.ResourceView{}, service.failRevoke(ctx, operation, event, "SECRET_CLEANUP_FAILED")
+		}
+		if err := service.secretStore.Delete(operationCtx, reference); err != nil {
 			return domain.ResourceView{}, service.failRevoke(ctx, operation, event, "SECRET_CLEANUP_FAILED")
 		}
 	}
@@ -377,6 +738,8 @@ func (service *Service) recordMappedFailure(ctx context.Context, _ identity.Prin
 		return domain.ErrIdempotencyConflict
 	case errors.Is(err, domain.ErrOperationInProgress):
 		return domain.ErrOperationInProgress
+	case errors.Is(err, domain.ErrOperationTerminal):
+		return ErrRotationFailed
 	case errors.Is(err, domain.ErrOperationCapacityReached):
 		return domain.ErrOperationCapacityReached
 	case errors.Is(err, domain.ErrTargetCapacityReached):
@@ -387,6 +750,14 @@ func (service *Service) recordMappedFailure(ctx context.Context, _ identity.Prin
 		return domain.ErrResourceAlreadyRevoked
 	case errors.Is(err, domain.ErrResourceNotActive):
 		return domain.ErrResourceNotActive
+	case errors.Is(err, domain.ErrRotationNotFound):
+		return domain.ErrRotationNotFound
+	case errors.Is(err, domain.ErrRotationMismatch):
+		return domain.ErrRotationMismatch
+	case errors.Is(err, domain.ErrRotationInProgress):
+		return domain.ErrRotationInProgress
+	case errors.Is(err, domain.ErrRotationReconciliation):
+		return domain.ErrRotationReconciliation
 	case errors.Is(err, authorization.ErrAuthorizationUnavailable):
 		return authorization.ErrAuthorizationUnavailable
 	default:
@@ -471,6 +842,18 @@ func safeErrorCode(err error) string {
 	}
 	if errors.Is(err, domain.ErrResourceNotActive) {
 		return "RESOURCE_NOT_ACTIVE"
+	}
+	if errors.Is(err, domain.ErrRotationNotFound) {
+		return "ROTATION_NOT_FOUND"
+	}
+	if errors.Is(err, domain.ErrRotationMismatch) {
+		return "ROTATION_ACKNOWLEDGEMENT_MISMATCH"
+	}
+	if errors.Is(err, domain.ErrRotationInProgress) {
+		return "ROTATION_IN_PROGRESS"
+	}
+	if errors.Is(err, domain.ErrRotationReconciliation) {
+		return "ROTATION_RECONCILIATION_REQUIRED"
 	}
 	return "OPERATION_UNAVAILABLE"
 }

@@ -30,7 +30,7 @@ var (
 	ErrInvalidPageSize     = errors.New("INVALID_PAGE_SIZE")
 )
 
-//go:embed migrations/0001_initial.sql
+//go:embed migrations/*.sql
 var migrationFiles embed.FS
 
 type Store struct {
@@ -49,6 +49,10 @@ func Open(path string) (*Store, error) {
 	}
 	if err := os.MkdirAll(filepath.Dir(absolutePath), 0o700); err != nil {
 		return nil, errors.New("unable to prepare SQLite directory")
+	}
+	directoryInfo, err := os.Stat(filepath.Dir(absolutePath))
+	if err != nil || !directoryInfo.IsDir() || directoryInfo.Mode().Perm()&0o077 != 0 {
+		return nil, ErrInsecureDatabase
 	}
 
 	file, err := os.OpenFile(absolutePath, os.O_CREATE|os.O_RDWR, 0o600)
@@ -374,33 +378,34 @@ func migrate(ctx context.Context, db *sql.DB) error {
 		return errors.New("unable to initialize SQLite migrations")
 	}
 
-	var applied bool
-	if err := db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 1)").Scan(&applied); err != nil {
-		return errors.New("unable to read SQLite migration state")
-	}
-	if applied {
-		return nil
-	}
-
-	migration, err := migrationFiles.ReadFile("migrations/0001_initial.sql")
-	if err != nil {
-		return errors.New("unable to read SQLite migration")
-	}
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return errors.New("unable to begin SQLite migration")
-	}
-	defer func() {
-		_ = tx.Rollback()
-	}()
-	if _, err := tx.ExecContext(ctx, string(migration)); err != nil {
-		return errors.New("unable to apply SQLite migration")
-	}
-	if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at_ns) VALUES(1, ?)", time.Now().UTC().UnixNano()); err != nil {
-		return errors.New("unable to record SQLite migration")
-	}
-	if err := tx.Commit(); err != nil {
-		return errors.New("unable to commit SQLite migration")
+	for version, path := range []string{"migrations/0001_initial.sql", "migrations/0002_staged_rotation.sql"} {
+		migrationVersion := version + 1
+		var applied bool
+		if err := db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = ?)", migrationVersion).Scan(&applied); err != nil {
+			return errors.New("unable to read SQLite migration state")
+		}
+		if applied {
+			continue
+		}
+		migration, err := migrationFiles.ReadFile(path)
+		if err != nil {
+			return errors.New("unable to read SQLite migration")
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return errors.New("unable to begin SQLite migration")
+		}
+		if _, err := tx.ExecContext(ctx, string(migration)); err != nil {
+			_ = tx.Rollback()
+			return errors.New("unable to apply SQLite migration")
+		}
+		if _, err := tx.ExecContext(ctx, "INSERT INTO schema_migrations(version, applied_at_ns) VALUES(?, ?)", migrationVersion, time.Now().UTC().UnixNano()); err != nil {
+			_ = tx.Rollback()
+			return errors.New("unable to record SQLite migration")
+		}
+		if err := tx.Commit(); err != nil {
+			return errors.New("unable to commit SQLite migration")
+		}
 	}
 	return nil
 }

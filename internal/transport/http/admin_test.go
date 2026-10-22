@@ -177,7 +177,7 @@ func TestAdminBearerTokenRejectsExpiredAndUnknownSubjects(t *testing.T) {
 func newAdminTestStore(t *testing.T) *sqlite.Store {
 	t.Helper()
 
-	store, err := sqlite.Open(filepath.Join(t.TempDir(), "control.db"))
+	store, err := sqlite.Open(filepath.Join(t.TempDir(), "database", "control.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}

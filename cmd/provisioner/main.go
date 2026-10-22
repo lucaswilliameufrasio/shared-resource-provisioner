@@ -27,6 +27,16 @@ func main() {
 }
 
 func run(args []string, getenv func(string) string, logger *slog.Logger) (runErr error) {
+	if len(args) > 0 && args[0] == "backup" {
+		if len(args) != 2 || args[1] == "" {
+			return errors.New("usage: provisioner backup <destination>")
+		}
+		if err := backupDatabase(args[1], getenv); err != nil {
+			return err
+		}
+		logger.Info("SQLite backup created")
+		return nil
+	}
 	if len(args) != 1 {
 		return errors.New("usage: provisioner <stdio|http>")
 	}
@@ -76,6 +86,7 @@ func run(args []string, getenv func(string) string, logger *slog.Logger) (runErr
 		return err
 	}
 	var lifecycle mcpserver.Lifecycle
+	var runtimeRotation httptransport.RuntimeRotation
 	if settings.MutationsEnabled {
 		lifecycleService, resources, err := drivers.NewConfiguredService(settings, store, authorizer, store)
 		if err != nil {
@@ -83,8 +94,13 @@ func run(args []string, getenv func(string) string, logger *slog.Logger) (runErr
 		}
 		defer resources.Close()
 		lifecycle = lifecycleService
+		runtimeRotation = lifecycleService
 	}
-	server, err := mcpserver.New(planner, logger, lifecycle)
+	mcpLifecycle := lifecycle
+	if args[0] == "stdio" && lifecycle != nil {
+		mcpLifecycle = stdioLifecycle{Lifecycle: lifecycle}
+	}
+	server, err := mcpserver.New(planner, logger, mcpLifecycle)
 	if err != nil {
 		return err
 	}
@@ -94,5 +110,35 @@ func run(args []string, getenv func(string) string, logger *slog.Logger) (runErr
 	if args[0] == "stdio" {
 		return stdiotransport.Serve(ctx, settings.StdioSubject, server)
 	}
-	return httptransport.Serve(ctx, settings, server, store, logger)
+	return httptransport.Serve(ctx, settings, server, store, logger, runtimeRotation)
+}
+
+type stdioLifecycle struct {
+	mcpserver.Lifecycle
+}
+
+func backupDatabase(destination string, getenv func(string) string) (runErr error) {
+	settings, err := config.LoadFromEnvironment(getenv)
+	if err != nil {
+		return err
+	}
+	if settings.SQLitePath == "" {
+		return errors.New("SQLite database path is required")
+	}
+	info, err := os.Lstat(settings.SQLitePath)
+	if err != nil || !info.Mode().IsRegular() {
+		return errors.New("SQLite database file is unavailable")
+	}
+
+	store, err := sqlite.Open(settings.SQLitePath)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := store.Close(); err != nil && runErr == nil {
+			runErr = err
+		}
+	}()
+
+	return store.Backup(context.Background(), destination)
 }

@@ -194,6 +194,9 @@ func (store *Store) ReserveRevoke(
 	if resource.Status == domain.ResourceRevoked {
 		return domain.Operation{}, resource, false, domain.ErrResourceAlreadyRevoked
 	}
+	if resource.RotationStatus != "" && resource.RotationStatus != domain.RotationReconciliationRequired {
+		return domain.Operation{}, resource, false, domain.ErrRotationInProgress
+	}
 	if resource.Status == domain.ResourceRevocationPending {
 		return domain.Operation{}, resource, false, domain.ErrOperationInProgress
 	}
@@ -322,24 +325,39 @@ func (store *Store) ClaimOperation(
 	}
 
 	resourceStatus := domain.ResourceProvisioning
+	resourceStatusValue := string(resourceStatus)
 	resourceStatusQuery := `
 		UPDATE resources SET status = ?, error_code = '', updated_at_ns = ?
 		WHERE id = ? AND status IN (?, ?, ?)
 	`
-	firstResourceStatus := string(domain.ResourceProvisioning)
-	secondResourceStatus := string(domain.ResourceFailed)
-	thirdResourceStatus := string(domain.ResourceReconciliation)
-	if operation.Action == domain.ActionRevokeResource {
+	resourceStatusArgs := []any{
+		resourceStatusValue, now.UnixNano(), resource.ID,
+		string(domain.ResourceProvisioning), string(domain.ResourceFailed), string(domain.ResourceReconciliation),
+	}
+	switch operation.Action {
+	case domain.ActionRotateResource:
+		resourceStatus = domain.ResourceActive
+		resourceStatusValue = string(domain.RotationStaging)
+		resourceStatusQuery = `
+			UPDATE resources SET rotation_status = ?, error_code = '', updated_at_ns = ?
+			WHERE id = ? AND status = ? AND rotation_status = ?
+		`
+		resourceStatusArgs = []any{
+			resourceStatusValue, now.UnixNano(), resource.ID,
+			string(domain.ResourceActive), string(domain.RotationStaging),
+		}
+	case domain.ActionRevokeResource:
 		resourceStatus = domain.ResourceRevocationPending
-		firstResourceStatus = string(domain.ResourceRevocationPending)
-		secondResourceStatus = string(domain.ResourceFailed)
-		thirdResourceStatus = string(domain.ResourceReconciliation)
-	} else if operation.Action != domain.ActionCreateResource {
+		resourceStatusValue = string(resourceStatus)
+		resourceStatusArgs = []any{
+			resourceStatusValue, now.UnixNano(), resource.ID,
+			string(domain.ResourceRevocationPending), string(domain.ResourceFailed), string(domain.ResourceReconciliation),
+		}
+	case domain.ActionCreateResource:
+	default:
 		return domain.Operation{}, domain.Resource{}, domain.ErrInvalidResourceTransition
 	}
-	resourceResult, err := tx.ExecContext(ctx, resourceStatusQuery,
-		string(resourceStatus), now.UnixNano(), resource.ID,
-		firstResourceStatus, secondResourceStatus, thirdResourceStatus)
+	resourceResult, err := tx.ExecContext(ctx, resourceStatusQuery, resourceStatusArgs...)
 	if err != nil {
 		return domain.Operation{}, domain.Resource{}, errors.New("unable to mark resource operation in progress")
 	}
@@ -360,9 +378,12 @@ func (store *Store) ClaimOperation(
 		return domain.Operation{}, domain.Resource{}, domain.ErrOperationCapacityReached
 	}
 	event.At = now
-	if operation.Action == domain.ActionRevokeResource {
+	switch operation.Action {
+	case domain.ActionRevokeResource:
 		event.Action = "resource.revoke.started"
-	} else {
+	case domain.ActionRotateResource:
+		event.Action = "resource.rotate.started"
+	case domain.ActionCreateResource:
 		event.Action = "resource.create.started"
 	}
 	event.EntityID = resource.ID
@@ -382,6 +403,13 @@ func (store *Store) ClaimOperation(
 	operation.UpdatedAt = now
 	operation.LeaseExpiresAt = leaseExpiresAt
 	resource.Status = resourceStatus
+	switch operation.Action {
+	case domain.ActionRotateResource:
+		resource.RotationStatus = domain.RotationStaging
+	case domain.ActionRevokeResource:
+		resource.Status = domain.ResourceRevocationPending
+		resource.ErrorCode = ""
+	}
 	resource.ErrorCode = ""
 	resource.UpdatedAt = now
 	return operation, resource, nil
@@ -583,7 +611,7 @@ func (store *Store) CompleteRevoke(ctx context.Context, operationID string, even
 	now := time.Now().UTC()
 	result, err := tx.ExecContext(ctx, `
 		UPDATE resources
-		SET status = ?, secret_uri = '', secret_version = '', error_code = '', updated_at_ns = ?
+		SET status = ?, secret_uri = '', secret_version = '', rotation_status = '', error_code = '', updated_at_ns = ?
 		WHERE id = ? AND status = ?
 	`, string(domain.ResourceRevoked), now.UnixNano(), resource.ID, string(domain.ResourceRevocationPending))
 	if err != nil {
@@ -616,6 +644,7 @@ func (store *Store) CompleteRevoke(ctx context.Context, operationID string, even
 	resource.Status = domain.ResourceRevoked
 	resource.SecretURI = ""
 	resource.SecretVersion = ""
+	resource.RotationStatus = ""
 	resource.ErrorCode = ""
 	resource.UpdatedAt = now
 	return resource, nil
@@ -729,7 +758,8 @@ func (store *Store) GetOperationByIdempotencyKey(ctx context.Context, subject st
 
 const resourceSelect = `
 	SELECT id, resource_type, application, environment, logical_name, target_id,
-	       status, secret_uri, secret_version, error_code, created_at_ns, updated_at_ns
+	       status, secret_uri, secret_version, credential_generation, rotation_status,
+	       error_code, created_at_ns, updated_at_ns
 	FROM resources
 `
 
@@ -737,6 +767,7 @@ func scanResource(scanner rowScanner) (domain.Resource, error) {
 	var resource domain.Resource
 	var resourceType string
 	var status string
+	var rotationStatus string
 	var createdAt int64
 	var updatedAt int64
 	if err := scanner.Scan(
@@ -749,6 +780,8 @@ func scanResource(scanner rowScanner) (domain.Resource, error) {
 		&status,
 		&resource.SecretURI,
 		&resource.SecretVersion,
+		&resource.CredentialGeneration,
+		&rotationStatus,
 		&resource.ErrorCode,
 		&createdAt,
 		&updatedAt,
@@ -757,6 +790,7 @@ func scanResource(scanner rowScanner) (domain.Resource, error) {
 	}
 	resource.ResourceType = domain.ResourceType(resourceType)
 	resource.Status = domain.ResourceStatus(status)
+	resource.RotationStatus = domain.RotationStatus(rotationStatus)
 	resource.CreatedAt = time.Unix(0, createdAt).UTC()
 	resource.UpdatedAt = time.Unix(0, updatedAt).UTC()
 	return resource, nil

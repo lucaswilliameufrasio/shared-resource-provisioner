@@ -158,9 +158,18 @@ func (driver *Driver) Create(ctx context.Context, resource domain.Resource) (pro
 }
 
 func (driver *Driver) Revoke(ctx context.Context, resource domain.Resource) error {
-	roleName, databaseName, err := objectNames(resource)
+	_, databaseName, err := objectNames(resource)
 	if err != nil {
 		return provisioning.NewDriverFailure("INVALID_RESOURCE_METADATA", false)
+	}
+	generations := credentialGenerations(resource)
+	roles := make([]string, 0, len(generations))
+	for _, generation := range generations {
+		roleName, _, err := roleNameForGeneration(resource, generation)
+		if err != nil {
+			return provisioning.NewDriverFailure("INVALID_RESOURCE_METADATA", false)
+		}
+		roles = append(roles, roleName)
 	}
 	adminConfig, err := driver.connectionConfig()
 	if err != nil {
@@ -174,22 +183,73 @@ func (driver *Driver) Revoke(ctx context.Context, resource domain.Resource) erro
 		_ = adminConn.Close(context.Background())
 	}()
 	ownerComment := ownerCommentPrefix + resource.ID
-	roleExists, roleComment, err := readRoleOwner(ctx, adminConn, roleName)
-	if err != nil {
-		return provisioning.NewDriverFailure("TARGET_UNAVAILABLE", true)
-	}
 	databaseExists, databaseComment, err := readDatabaseOwner(ctx, adminConn, databaseName)
 	if err != nil {
 		return provisioning.NewDriverFailure("TARGET_UNAVAILABLE", true)
 	}
-	if roleExists && roleComment != ownerComment || databaseExists && databaseComment != ownerComment {
+	if databaseExists && databaseComment != ownerComment {
 		return provisioning.NewDriverFailure("RESOURCE_OWNERSHIP_MISMATCH", false)
 	}
-	if !roleExists && !databaseExists {
+	if databaseExists {
+		databaseOwner, err := readDatabaseOwnerName(ctx, adminConn, databaseName)
+		if err != nil {
+			return provisioning.NewDriverFailure("TARGET_UNAVAILABLE", true)
+		}
+		ownedByManagedRole := false
+		for _, roleName := range roles {
+			if databaseOwner == roleName {
+				ownedByManagedRole = true
+				break
+			}
+		}
+		if !ownedByManagedRole {
+			return provisioning.NewDriverFailure("RESOURCE_OWNERSHIP_MISMATCH", false)
+		}
+	}
+	roleExists := make([]bool, len(roles))
+	for index, roleName := range roles {
+		var roleComment string
+		roleExists[index], roleComment, err = readRoleOwner(ctx, adminConn, roleName)
+		if err != nil {
+			return provisioning.NewDriverFailure("TARGET_UNAVAILABLE", true)
+		}
+		if roleExists[index] && roleComment != ownerComment {
+			return provisioning.NewDriverFailure("RESOURCE_OWNERSHIP_MISMATCH", false)
+		}
+	}
+	anyRoleExists := false
+	for _, exists := range roleExists {
+		if exists {
+			anyRoleExists = true
+			break
+		}
+	}
+	if !anyRoleExists && !databaseExists {
 		return nil
 	}
-	if roleExists {
+	for index, roleName := range roles {
+		if !roleExists[index] {
+			continue
+		}
 		if _, err := adminConn.Exec(ctx, "ALTER ROLE "+quoteIdentifier(roleName)+" NOLOGIN"); err != nil {
+			return provisioning.NewDriverFailure("DRIVER_FAILURE", true)
+		}
+	}
+	for memberIndex, memberRole := range roles {
+		if !roleExists[memberIndex] {
+			continue
+		}
+		for inheritedIndex := 0; inheritedIndex < memberIndex; inheritedIndex++ {
+			if !roleExists[inheritedIndex] {
+				continue
+			}
+			if _, err := adminConn.Exec(ctx, "REVOKE "+quoteIdentifier(roles[inheritedIndex])+" FROM "+quoteIdentifier(memberRole)); err != nil {
+				return provisioning.NewDriverFailure("DRIVER_FAILURE", true)
+			}
+		}
+	}
+	for _, roleName := range roles {
+		if _, err := adminConn.Exec(ctx, "SELECT pg_catalog.pg_terminate_backend(pid) FROM pg_catalog.pg_stat_activity WHERE usename = $1 AND pid <> pg_catalog.pg_backend_pid()", roleName); err != nil {
 			return provisioning.NewDriverFailure("DRIVER_FAILURE", true)
 		}
 	}
@@ -198,8 +258,11 @@ func (driver *Driver) Revoke(ctx context.Context, resource domain.Resource) erro
 			return provisioning.NewDriverFailure("DRIVER_FAILURE", true)
 		}
 	}
-	if roleExists {
-		if _, err := adminConn.Exec(ctx, "DROP ROLE "+quoteIdentifier(roleName)); err != nil {
+	for index := len(roles) - 1; index >= 0; index-- {
+		if !roleExists[index] {
+			continue
+		}
+		if _, err := adminConn.Exec(ctx, "DROP ROLE "+quoteIdentifier(roles[index])); err != nil {
 			return provisioning.NewDriverFailure("DRIVER_FAILURE", true)
 		}
 	}

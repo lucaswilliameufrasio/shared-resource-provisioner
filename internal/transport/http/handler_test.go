@@ -20,7 +20,7 @@ func TestNewHandlerKeepsHealthOpenAndMCPAuthenticated(t *testing.T) {
 		&mcp.Implementation{Name: "test", Version: "test"},
 		&mcp.ServerOptions{},
 	)
-	store, err := sqlite.Open(filepath.Join(t.TempDir(), "control.db"))
+	store, err := sqlite.Open(filepath.Join(t.TempDir(), "database", "control.db"))
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}

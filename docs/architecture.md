@@ -1,9 +1,9 @@
 # Architecture and operating model
 
-Status: the control-plane lifecycle and target drivers are implemented. MCP
-mutations remain disabled by default; production use still requires operator
-configuration and operational recovery/readiness review. Credential rotation is
-intentionally unavailable until runtime adoption can be acknowledged.
+Status: the control-plane lifecycle, staged credential rotation, and OIDC runtime
+adoption routes are implemented and tested against isolated local dependencies.
+MCP mutations remain disabled by default; production use still requires
+operator configuration and operational recovery/readiness review.
 
 ## Actors and responsibilities
 
@@ -12,9 +12,9 @@ intentionally unavailable until runtime adoption can be acknowledged.
   issuer/audience, the exact OIDC subjects allowed to administer grants,
   per-target limits, and the Ciphera project/identity mappings. These values
   never come from MCP tool arguments.
-- **MCP caller:** plans and, after the required drivers exist, requests named
-  resource lifecycle operations within its authorized application/environment
-  scope.
+- **MCP caller:** plans and requests named resource lifecycle operations within
+  its authorized application/environment scope; rotation is available only over
+  the HTTP transport when mutations are enabled.
 - **Application runtime:** Docker Compose workloads use Ciphera's read-only,
   environment- and key-prefix-scoped identity through `ciphera run`. Ciphera
   injects plaintext into the trusted workload's process environment; this is
@@ -40,12 +40,17 @@ intentionally unavailable until runtime adoption can be acknowledged.
    create or operate the underlying clusters or Ciphera projects/identities.
 3. **Inspect:** authorized callers see bounded metadata and a safe secret
    reference. Connection strings and credential values are never returned.
-4. **Rotate (blocked):** rotation is staged: issue and store a new
-   credential, publish its reference to the runtime binding, wait for explicit
-   runtime adoption, and only then revoke the old credential. The initial
-   Compose/Ciphera integration has no adoption acknowledgement yet, so rotation
-   must not be exposed until that contract exists. No immediate cutover that
-   silently disconnects running applications.
+4. **Rotate:** an authorized HTTP MCP caller starts a staged rotation. The
+   provisioner writes the new credential under a distinct generation-scoped
+   Ciphera key, while keeping the old target identity and reference active. The
+   OIDC-authenticated workload polls `/v1/runtime/resources/{id}/rotations/pending`,
+   loads the reference through its own scoped Ciphera identity, and posts the
+   exact operation, reference, version, and generation to the acknowledgement
+   route. Only a matching, audited acknowledgement allows target cutover and old
+   secret cleanup. Rotation is omitted from stdio, which has no workload OIDC
+   identity. A failed post-ack cutover remains in reconciliation; retrying the
+   exact acknowledgement retries finalization. A candidate whose pre-ack
+   cleanup fails is not returned by polling and requires operator reconciliation.
 5. **Revoke:** caller supplies the stable resource identity and an
    explicit confirmation value. The service first disables access, records the
    transition, and then applies the configured cleanup/retention policy.
@@ -63,8 +68,18 @@ only to the selected secret store.
 SQLite persists resource metadata, idempotency, grants, and append-only audit
 records; secrets remain in Ciphera. The mutation gate is off unless
 `SRP_MUTATIONS_ENABLED=true` and both target and Ciphera configuration files are
-provided. Rotation is not advertised. Production enablement remains an explicit
-operator decision after recovery and target readiness checks.
+provided. Rotation is exposed only when mutations are enabled and the HTTP
+transport is used; the workload subject needs an exact `adopt_rotation` grant
+for the resource scope. Production enablement remains an explicit operator
+decision after recovery and target readiness checks.
+
+The SQLite database and its containing directory must be owner-only (`0600`
+file, `0700` directory). HTTP shutdown stops accepting new requests and drains
+in-flight requests for up to 60 seconds, enough for the configured 45-second
+operation timeout plus the 10-second cleanup window and a small margin. The
+service manager must grant a longer termination window; see the deployment
+hardening checklist. A forced stop after a drain timeout may leave an operation
+pending for idempotent retry or reconciliation.
 
 ## Module boundaries
 
@@ -79,20 +94,25 @@ operator decision after recovery and target readiness checks.
   returns an opaque reference; no read/get method is exposed to MCP handlers.
 - `audit`: append-only operation facts, excluding request bodies, credentials,
   and connection strings.
-- `drivers`: explicit typed PostgreSQL, Valkey, and NATS operations. A driver
-  cannot accept arbitrary SQL/commands from a caller.
+- `drivers`: explicit typed PostgreSQL, Valkey, and NATS operations, including
+  generation-specific staged rotation and idempotent finalization/abort. A
+  driver cannot accept arbitrary SQL/commands from a caller.
 - `transport/mcp`: maps named MCP tools to use cases. It is an adapter only.
 - `transport/http`: Streamable HTTP MCP, OIDC authentication, health probes,
-  strict listener configuration, and a separate REST admin surface (never
-  exposed as MCP tools).
+  strict listener configuration, a separate REST admin surface, and protected
+  runtime rotation polling/acknowledgement routes (never exposed as MCP tools).
 - `transport/stdio`: local process identity and MCP stdio lifecycle.
 
 ## Isolation contract
 
-- PostgreSQL: one database and least-privilege role per application/environment.
-- Valkey: one ACL identity per application/environment, restricted to the
+- PostgreSQL: one database and generation-specific least-privilege login role
+  per application/environment; role privileges/ownership transfer only after
+  acknowledgement.
+- Valkey: generation-specific ACL identities per application/environment,
+  restricted to the
   assigned key and channel prefixes and required commands.
-- NATS: one account/identity boundary per application/environment, with
+- NATS: one account boundary and generation-specific user identities per
+  application/environment, with
   JetStream limits scoped to that boundary when enabled.
 - Targets and their endpoints are selected from server-side configuration;
   callers cannot submit hostnames, ports, DSNs, or credentials.
@@ -149,12 +169,10 @@ must be completed before enabling production provisioning:
    per-target limits; protect all owner-only secret files and Ciphera identities.
 2. Complete the control-plane host-loss restore drill and validate protected
    SQLite backups in the intended deployment environment.
-3. Run the isolated driver integration suite in CI and extend end-to-end
-   provisioning/reconciliation tests against the actual configured secret-store
-   protocol before production enablement.
-4. Define and test runtime adoption acknowledgement and failure recovery before
-   exposing staged rotation.
-5. Complete deployment hardening, observability, security review, and operational
+3. Validate Ciphera delivery and end-to-end compensation/reconciliation in the
+   intended environment; the local protocol fake does not validate the configured
+   tenant, identities, project mappings, or runtime key-prefix grants.
+4. Complete deployment hardening, observability, security review, and operational
    recovery procedures for each enabled target.
 
 The code may define stable ports and validation independent of these choices;
