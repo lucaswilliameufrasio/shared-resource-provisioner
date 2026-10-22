@@ -79,10 +79,21 @@
   integration suite passed three consecutive fresh runs. `govulncheck` reported
   no reachable vulnerabilities and one required-module advisory not called by
   analyzed code.
-- The read-only SSH inspection of `tirion-tailscale` found the provisioner
-  service inactive and no matching process/container. The host is shared, so
-  this is not evidence of an isolated deployment or recovery host; no host state
-  was changed.
+- A read-only SSH inspection of the previously checked shared host found the
+  provisioner service inactive and no matching process/container. This is not
+  evidence of an isolated deployment or recovery host; no host state was
+  changed.
+- A synthetic cross-host restore smoke test then passed on a distinct
+  user-managed Linux host: a protected SQLite backup with fake references was
+  transferred over SSH, restored under a new `0700` directory with a `0600`
+  database, and its grant/resource/pending-rotation state was verified through
+  the provisioner's persistence code. The actual provisioner binary started
+  there in stdio mode with mutations disabled and no target/Ciphera config; MCP
+  exposed only `plan_resource`, and a read-only plan call succeeded. All remote
+  temporary files were removed. This proves cross-host file transfer and
+  application restore on that host, not its isolation: a default route existed,
+  and no production target routes, backup retention policy, or approved RPO/RTO
+  were configured or tested.
 
 ## Accepted first-deployment choices
 
@@ -103,12 +114,13 @@
 
 ## Remaining readiness work
 
-1. **Not locally provable:** the host-loss drill has been simulated with a
-   protected SQLite snapshot restored to a distinct local path and a new
-   read-only process. This verifies application state recovery, including a
-   pending rotation. It cannot establish physical host loss, off-host backup
-   transfer/retention, independent recovery access, or measured deployment
-   RPO/RTO.
+1. **Cross-host recovery path validated; deployment criteria unverified:** a
+   synthetic backup was transferred to a distinct remote host and restored;
+   the restored grant/resource/pending-rotation state was verified and the real
+   provisioner ran read-only there. This still cannot establish physical host
+   loss, network isolation from production targets, off-host backup
+   retention/independent access, or whether the measured recovery meets an
+   approved deployment RPO/RTO.
 2. **Locally validated; deployment-specific configuration unverified:** the
    real Ciphera client/service and all three drivers were exercised with
    disposable local identities/targets, and the production OIDC verifier plus
@@ -120,12 +132,14 @@
    validation, restrictive SQLite permissions, disabled-by-default mutations,
    audit/authorization paths, graceful shutdown, and structured logging are
    covered by code/tests and the local runbooks. The shared SSH host inspection
-   was read-only and found no provisioner deployment. Physical host/runtime
+   was read-only and found no provisioner deployment; the separate-host smoke
+   used no service or production configuration. Physical host/runtime
    boundaries, external monitoring delivery, and an accountable deployment
-   security review cannot be established by local simulation.
+   security review remain unverified.
 4. Keep the complete local quality gate and CI jobs passing for every future
-   change. The Go 1.27.3 local gate and three rootless integration runs passed;
-   check CI after the current follow-up is pushed.
+   change. The Go 1.27.3 local gate, three rootless integration runs, and CI for
+   the latest code commit passed; check CI again after documentation updates are
+   pushed.
 
 Each mutation slice includes authorization, idempotency, audit, compensating or
 reconciliation behavior, and tests against the real service before the MCP tool
