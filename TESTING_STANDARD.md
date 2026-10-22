@@ -5,9 +5,9 @@
 - Go toolchain: 1.27.3 or newer. `govulncheck` reports GO-2026-6809 as
   reachable with Go 1.27.2; this standard-library vulnerability is fixed in
   Go 1.27.3.
-- Unit tests use local files and in-memory MCP transport tests; they do not
-  require Docker, PostgreSQL, Valkey, NATS, an OIDC provider, or production
-  credentials.
+- Unit tests use local files, an in-process OIDC issuer, and in-memory MCP
+  transport tests; they do not require Docker, PostgreSQL, Valkey, NATS, an
+  external OIDC provider, or production credentials.
 - Integration tests use the pinned `postgres:17.6-alpine` and
   `valkey/valkey:8.1.3-alpine` images plus an in-process NATS server. Compose
   publishes only random host ports on `127.0.0.1`, creates no persistent
@@ -56,6 +56,10 @@ checked local tool versions are golangci-lint 2.14.0 and govulncheck 1.7.0.
 - Keep OIDC runtime polling/acknowledgement, exact-scope authorization, durable
   replay behavior, restart recovery, and staged driver integration tests in the
   required gate whenever rotation changes.
+- Exercise the production OIDC verifier against a locally signed issuer and the
+  real HTTP router in automated tests. This proves protocol handling locally;
+  validating the intended deployment issuer, TLS trust, and network policy is a
+  separate deployment check.
 - Reassess local storage and test-container impact before adding or running
   container-heavy suites; use the verified rootless Docker context when needed.
 - Do not enable mutations in production until the configured target and Ciphera

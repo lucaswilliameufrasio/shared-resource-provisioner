@@ -67,10 +67,22 @@
   state and planned without exposing mutation tools. This validates the real
   local service/API path, not the intended deployment's Ciphera identities or
   network policy; runtime OIDC JWT validation was not part of this drill.
+- On 2026-10-21, HTTP authentication tests used a locally generated RSA signing
+  key and an in-process OIDC issuer serving discovery and JWKS over loopback.
+  The production verifier accepted a correctly signed token and rejected wrong
+  audience, expired, and invalid-subject tokens; the real HTTP router accepted
+  the valid token for rotation polling/acknowledgement and rejected a wrong-
+  audience token. No external issuer or credentials were used. This validates
+  verifier/router behavior, not deployment issuer configuration, TLS trust, or
+  network policy.
 - The complete Go quality gate passed again on Go 1.27.3. The isolated rootless
   integration suite passed three consecutive fresh runs. `govulncheck` reported
   no reachable vulnerabilities and one required-module advisory not called by
   analyzed code.
+- The read-only SSH inspection of `tirion-tailscale` found the provisioner
+  service inactive and no matching process/container. The host is shared, so
+  this is not evidence of an isolated deployment or recovery host; no host state
+  was changed.
 
 ## Accepted first-deployment choices
 
@@ -91,27 +103,29 @@
 
 ## Remaining readiness work
 
-1. **Operator-blocked:** complete the control-plane host-loss restore drill in
-   the intended deployment environment. The operator must approve backup
-   frequency, encrypted off-host retention, RPO/RTO, owner, and recovery host.
-   The expanded local test verifies application data (including a pending
-   rotation) but cannot establish host/storage/transfer properties or measured
-   RTO/RPO.
-2. **Operator-blocked:** validate the intended isolated Ciphera tenant/project
-   identities, target mappings, network policy, runtime key-prefix access, and
-   deployment OIDC identity flow. The local drill now exercises the real Ciphera
-   service/client and all three drivers with temporary identities and disposable
-   targets, in addition to the protocol-fake tests; it does not establish that
-   the intended deployment configuration is correct. Do not use shared or
-   production services for local tests.
-3. **Operator-blocked:** complete environment-specific deployment hardening,
-   monitoring, security review, and recovery procedures. Requires the intended
-   host/runtime, network boundaries, service-enforceable limits, identity setup,
-   monitoring destination, and an accountable reviewer. The repository checklist
-   is a baseline, not evidence of an operator review.
+1. **Not locally provable:** the host-loss drill has been simulated with a
+   protected SQLite snapshot restored to a distinct local path and a new
+   read-only process. This verifies application state recovery, including a
+   pending rotation. It cannot establish physical host loss, off-host backup
+   transfer/retention, independent recovery access, or measured deployment
+   RPO/RTO.
+2. **Locally validated; deployment-specific configuration unverified:** the
+   real Ciphera client/service and all three drivers were exercised with
+   disposable local identities/targets, and the production OIDC verifier plus
+   HTTP rotation router were exercised against a signed local issuer. This does
+   not establish the intended tenant/project identities, target mappings,
+   runtime key-prefix access, deployed issuer/TLS trust, or network policy. Do
+   not use shared or production services for local tests.
+3. **Locally reviewed; deployment-specific evidence unavailable:** configuration
+   validation, restrictive SQLite permissions, disabled-by-default mutations,
+   audit/authorization paths, graceful shutdown, and structured logging are
+   covered by code/tests and the local runbooks. The shared SSH host inspection
+   was read-only and found no provisioner deployment. Physical host/runtime
+   boundaries, external monitoring delivery, and an accountable deployment
+   security review cannot be established by local simulation.
 4. Keep the complete local quality gate and CI jobs passing for every future
-   change. This follow-up's local gate and push-triggered CI are green; check CI
-   again after any later authorized push.
+   change. The Go 1.27.3 local gate and three rootless integration runs passed;
+   check CI after the current follow-up is pushed.
 
 Each mutation slice includes authorization, idempotency, audit, compensating or
 reconciliation behavior, and tests against the real service before the MCP tool

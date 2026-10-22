@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lucaswilliameufrasio/shared-resource-provisioner/internal/domain"
 	"github.com/lucaswilliameufrasio/shared-resource-provisioner/internal/identity"
@@ -40,11 +41,18 @@ func TestRuntimeRotationEndpointsRequireOIDCAndUseExactAcknowledgement(t *testin
 		Generation:      2,
 		Status:          domain.RotationPending,
 	}}
+	issuer := newLocalOIDCIssuer(t)
+	const audience = "shared-resource-provisioner-local-test"
+	verifier, err := NewOIDCTokenVerifier(context.Background(), issuer.server.URL, audience)
+	if err != nil {
+		t.Fatalf("NewOIDCTokenVerifier() error = %v", err)
+	}
+	token := issuer.signedToken(t, "subject-123", audience, time.Now().Add(time.Minute))
 	handler, err := NewHandler(
 		server,
-		testTokenVerifier,
+		verifier,
 		"http://127.0.0.1:8080/mcp",
-		"https://issuer.example.test",
+		issuer.server.URL,
 		slog.New(slog.NewTextHandler(discardWriter{}, nil)),
 		store,
 		[]string{"subject-123"},
@@ -60,9 +68,16 @@ func TestRuntimeRotationEndpointsRequireOIDCAndUseExactAcknowledgement(t *testin
 	if unauthorized.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthorized pending status = %d, want 401", unauthorized.Code)
 	}
+	invalidTokenRequest := httptest.NewRequest(http.MethodGet, pendingURL, nil)
+	invalidTokenRequest.Header.Set("Authorization", "Bearer "+issuer.signedToken(t, "subject-123", "wrong-audience", time.Now().Add(time.Minute)))
+	invalidTokenResponse := httptest.NewRecorder()
+	handler.ServeHTTP(invalidTokenResponse, invalidTokenRequest)
+	if invalidTokenResponse.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong-audience pending status = %d, want 401", invalidTokenResponse.Code)
+	}
 
 	pendingRequest := httptest.NewRequest(http.MethodGet, pendingURL, nil)
-	pendingRequest.Header.Set("Authorization", "Bearer test-token")
+	pendingRequest.Header.Set("Authorization", "Bearer "+token)
 	pendingResponse := httptest.NewRecorder()
 	handler.ServeHTTP(pendingResponse, pendingRequest)
 	if pendingResponse.Code != http.StatusOK || pendingResponse.Header().Get("Cache-Control") != "no-store" {
@@ -78,7 +93,7 @@ func TestRuntimeRotationEndpointsRequireOIDCAndUseExactAcknowledgement(t *testin
 
 	acknowledgementURL := "/v1/runtime/resources/resource-123/rotations/acknowledgements"
 	malformed := httptest.NewRequest(http.MethodPost, acknowledgementURL, strings.NewReader(`{"operation_id":"operation-123","unexpected":true}`))
-	malformed.Header.Set("Authorization", "Bearer test-token")
+	malformed.Header.Set("Authorization", "Bearer "+token)
 	malformed.Header.Set("Content-Type", "application/json")
 	malformedResponse := httptest.NewRecorder()
 	handler.ServeHTTP(malformedResponse, malformed)
@@ -86,7 +101,7 @@ func TestRuntimeRotationEndpointsRequireOIDCAndUseExactAcknowledgement(t *testin
 		t.Fatalf("malformed acknowledgement status=%d, calls=%d", malformedResponse.Code, lifecycle.acknowledgements)
 	}
 	missingVersion := httptest.NewRequest(http.MethodPost, acknowledgementURL, strings.NewReader(`{"operation_id":"operation-123","secret_reference":"ciphera://project/project-123/environments/production/secrets/ROT_PG_0000000000002","generation":2}`))
-	missingVersion.Header.Set("Authorization", "Bearer test-token")
+	missingVersion.Header.Set("Authorization", "Bearer "+token)
 	missingVersion.Header.Set("Content-Type", "application/json")
 	missingVersionResponse := httptest.NewRecorder()
 	handler.ServeHTTP(missingVersionResponse, missingVersion)
@@ -96,7 +111,7 @@ func TestRuntimeRotationEndpointsRequireOIDCAndUseExactAcknowledgement(t *testin
 
 	body := `{"operation_id":"operation-123","secret_reference":"` + lifecycle.pending.SecretReference + `","secret_version":"generation-2","generation":2}`
 	acknowledgementRequest := httptest.NewRequest(http.MethodPost, acknowledgementURL, strings.NewReader(body))
-	acknowledgementRequest.Header.Set("Authorization", "Bearer test-token")
+	acknowledgementRequest.Header.Set("Authorization", "Bearer "+token)
 	acknowledgementRequest.Header.Set("Content-Type", "application/json")
 	acknowledgementResponse := httptest.NewRecorder()
 	handler.ServeHTTP(acknowledgementResponse, acknowledgementRequest)
