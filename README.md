@@ -110,6 +110,13 @@ projects/identities, TLS material, or operator-only target keys. Follow the
 [host-loss recovery drill](docs/runbooks/host-loss-recovery.md) before enabling
 mutations on a recovered instance.
 
+## Production deployment
+
+The production Docker Compose deployment, container build, host prerequisites,
+configuration mounts, and update/backup procedure are documented in
+[DEPLOY.md](DEPLOY.md). It is a single-node deployment and keeps mutations
+disabled by default.
+
 PostgreSQL endpoint files must contain a PostgreSQL URI; remote endpoints
 require `sslmode=verify-full`. Its accepted query options are `sslmode`,
 `sslrootcert`, `connect_timeout`, `application_name`, and

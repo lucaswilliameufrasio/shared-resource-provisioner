@@ -1,0 +1,35 @@
+services:
+  provisioner:
+    image: shared-resource-provisioner:${SRP_IMAGE_TAG:-local}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 75s
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    environment:
+      SRP_HTTP_ADDR: 0.0.0.0:8443
+      SRP_SQLITE_PATH: /var/lib/shared-resource-provisioner/control.db
+      SRP_TLS_CERT_FILE: /etc/srp/tls/tls.crt
+      SRP_TLS_KEY_FILE: /etc/srp/tls/tls.key
+      SRP_AUTHZ_POLICY_FILE: /etc/srp/policy.json
+      SRP_TARGETS_FILE: /etc/srp/targets.json
+      SRP_CIPHERA_CONFIG_FILE: /etc/srp/ciphera.json
+      SRP_MCP_RESOURCE_URL: ${SRP_MCP_RESOURCE_URL:?Set the public HTTPS MCP URL, for example https://provisioner.example.com/mcp}
+      SRP_OIDC_ISSUER_URL: ${SRP_OIDC_ISSUER_URL:?Set the HTTPS OIDC issuer URL}
+      SRP_OIDC_AUDIENCE: ${SRP_OIDC_AUDIENCE:?Set the OIDC audience}
+      SRP_ADMIN_SUBJECTS: ${SRP_ADMIN_SUBJECTS:?Set a JSON array of exact OIDC admin subjects}
+      SRP_MUTATIONS_ENABLED: ${SRP_MUTATIONS_ENABLED:-false}
+    ports:
+      - "127.0.0.1:${SRP_HOST_PORT:-8443}:8443"
+    volumes:
+      - ${SRP_DATA_DIR:?Set SRP_DATA_DIR to a protected persistent host directory}:/var/lib/shared-resource-provisioner
+      - ${SRP_CONFIG_DIR:?Set SRP_CONFIG_DIR to the protected configuration directory}:/etc/srp:ro
+      - ${SRP_SECRETS_DIR:?Set SRP_SECRETS_DIR to the protected secret files directory}:/run/secrets:ro

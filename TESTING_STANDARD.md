@@ -8,8 +8,9 @@
 - Unit tests use local files, an in-process OIDC issuer, and in-memory MCP
   transport tests; they do not require Docker, PostgreSQL, Valkey, NATS, an
   external OIDC provider, or production credentials.
-- Integration tests use the pinned `postgres:17.6-alpine` and
-  `valkey/valkey:8.1.3-alpine` images plus an in-process NATS server. Compose
+- Integration tests use the pinned `postgres:18.6-alpine3.24` and
+  `valkey/valkey:9.1.2-alpine3.24` images plus an in-process NATS server
+  (`github.com/nats-io/nats-server/v2` v2.15.1). Compose
   publishes only random host ports on `127.0.0.1`, creates no persistent
   volumes, and uses passwordless test-only service auth inside the disposable
   containers. Never point the tests at shared or production services.

@@ -10,6 +10,7 @@
 .env
 .env.*
 !.env.example
+!.env.production.example
 /config/*.local.json
 /secrets/
 *.pem
